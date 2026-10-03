@@ -80,7 +80,7 @@ namespace RC::Combine::Manager
 			std::vector<std::uint32_t>    refs;                 // form IDs of the references it draws meshes of
 			std::uint32_t                 members{ 0 };
 			std::uint32_t                 triangles{ 0 };
-			std::uint32_t                 seen{ 0 };            // ticks after a frame whose main view found it visible
+			std::uint64_t                 previsVisible{ 0 };   // the tick before the last query that found it visible
 			bool                          registered{ false };  // a previs dynamic object (Engine::RegisterPrevisObject)
 
 			// What a view's culling group gets, and what previs tests: the fade node, or the mesh itself.
@@ -143,7 +143,6 @@ namespace RC::Combine::Manager
 		bool          g_previsPaused{ false };  // previs active and no query hook: originals shown
 		bool          g_cbroLoaded{ false };    // CBRO is loaded (read at the first tick)
 		bool          g_previsHook{ false };    // the previs query hook is in (Engine::InstallPrevisQueryHook)
-		bool          g_fadeNodesBroken{ false };  // the runtime check saw fade-node chunks go undrawn: plain chunks only
 		bool          g_keyDown{ false };
 		std::size_t   g_watchCursor{ 0 };
 		std::atomic<DWORD> g_mainThread{ 0 };  // the thread running PlayerCharacter::Update (set by the first tick)
@@ -161,6 +160,7 @@ namespace RC::Combine::Manager
 
 		std::uint64_t g_previsTick{ 0 };       // the tick of the last query that ran with previs active
 		std::uint64_t g_previsFrames{ 0 };     // queries that ran with previs active, since the last summary
+		std::uint32_t g_previsVisible{ 0 };    // chunks the last query's main-view pass found visible
 		bool          g_group0Drawn{ false };  // the last tick saw a probe the main view drew
 
 		// ---- bake thread ---------------------------------------------------------------------------------------
@@ -466,12 +466,28 @@ namespace RC::Combine::Manager
 		// added to the main view, the sun's cascades and the precipitation map as their originals were
 		// (FO4-ENGINE-NOTES 5.5d). With CBRO in classic mode the main and sun records go unused (CBRO suspends previs
 		// over the cull and the cascades) and group 0 draws the chunks instead.
+		// Also reads, at the one moment it means that, which chunks the query's main-view pass found visible
+		// (Engine::SeenByMainView): for the audit.
 		void OnPrevisQuery() noexcept
 		{
-			if (Engine::PrevisActive()) {
-				g_previsTick = g_frame;
-				++g_previsFrames;
+			if (!Engine::PrevisActive()) {
+				return;
 			}
+			g_previsTick = g_frame;
+			++g_previsFrames;
+			std::uint32_t visible = 0;
+			for (auto& [cell, state] : g_cells) {
+				if (!state.applied || state.applied->fallback) {
+					continue;
+				}
+				for (auto& record : state.applied->chunks) {
+					if (record.registered && Engine::SeenByMainView(record.Fed())) {
+						record.previsVisible = g_frame;
+						++visible;
+					}
+				}
+			}
+			g_previsVisible = visible;
 		}
 
 		// ---- apply ---------------------------------------------------------------------------------------------
@@ -556,7 +572,7 @@ namespace RC::Combine::Manager
 			// With bChunkFadeNodes, a cell gathered while its references are still fading in after attach: each chunk
 			// carries on from the furthest fade among its originals, read before they are hidden. An original this
 			// plugin hid is drawn by the old chunk, faded in (FO4-ENGINE-NOTES 7.8). Without, chunks are drawn at once.
-			const bool         fadeNodes = Settings::Get().chunkFadeNodes && !g_fadeNodesBroken;
+			const bool         fadeNodes = Settings::Get().chunkFadeNodes;
 			std::vector<float> fades;
 			for (const auto& bucket : a_job.buckets) {
 				for (const auto& chunk : bucket.chunks) {
@@ -1067,15 +1083,17 @@ namespace RC::Combine::Manager
 				float              distance{ 0.0F };
 				const ChunkRecord* record{ nullptr };
 				std::uint32_t      cell{ 0 };
+				const char*        material{ nullptr };
+				std::uint64_t      shaderFlags{ 0 };
 			};
-			std::size_t          total = 0, drawn = 0, blended = 0, inView = 0, fading = 0, foreign = 0, filed = 0, seen = 0, moving = 0, unreadable = 0,
-			                     undrawnSeen = 0;
+			std::size_t          total = 0, drawn = 0, blended = 0, inView = 0, fading = 0, foreign = 0, filed = 0, moving = 0, unreadable = 0;
 			std::vector<Suspect> suspects;
 			const auto           camera = RE::Main::WorldRootCamera();
-			// A chunk can be expected on screen when nothing culls it but the frustum (group 0 drawn, no CBRO, an
-			// exterior: interiors cull by portals), or when the last frame's main view found it visible (previs's test
-			// of its dynamic objects, or group 0's).
+			// A chunk in view is expected drawn when nothing culls it but the frustum (group 0 drawn, no CBRO, an
+			// exterior: interiors cull by portals), or when the main view draws previs's records and the last query
+			// found it visible. CBRO's own culling of group 0 can't be read here: no expectation then.
 			const bool frustumOnly = g_group0Drawn && !g_cbroLoaded && !Engine::InInterior();
+			const bool previsDraws = PrevisFeeds() && !g_group0Drawn;
 			for (const auto& [cell, state] : g_cells) {
 				if (!state.applied) {
 					continue;
@@ -1093,17 +1111,14 @@ namespace RC::Combine::Manager
 					fading += view.fade < 1.0F ? 1 : 0;
 					foreign += view.owner ? 0 : 1;
 					filed += view.inView ? 1 : 0;
-					seen += view.seen ? 1 : 0;
 					moving += view.moving ? 1 : 0;
-					// Found visible by the main view in 60+ frames, fully faded in, and still never drawn: the fade-node
-					// path doesn't draw (the runtime check below).
-					undrawnSeen += record.fadeNode && record.seen >= 60 && view.fade >= 1.0F && !view.passes ? 1 : 0;
-					const bool expected = frustumOnly || view.seen;
+					const bool expected = frustumOnly || (previsDraws && g_frame - record.previsVisible <= 1);
 					if (camera && settled && expected && InView(*camera, record.shape->worldBound)) {
 						++inView;
 						if (!view.passes) {
 							const auto& eye = camera->world.translate;
-							suspects.push_back({ record.shape->worldBound.center.GetDistance(eye), &record, state.formID });
+							suspects.push_back({ record.shape->worldBound.center.GetDistance(eye), &record, state.formID, view.material,
+								view.shaderFlags });
 						}
 					}
 				}
@@ -1112,41 +1127,21 @@ namespace RC::Combine::Manager
 				return;
 			}
 			std::string fadeNodes;
-			if (Settings::Get().chunkFadeNodes && !g_fadeNodesBroken) {
+			if (Settings::Get().chunkFadeNodes) {
 				fadeNodes = std::format("; fade nodes: filed by a view at the last cull {}, fading {}, fade alpha from another node {}", filed,
 					fading, foreign);
 			}
-			logger::info("chunk audit: {} chunks, drawn at least once {} (blended {}), found visible by the last frame's main view {}, moving for "
-						 "TAA {} (should be 0); on screen within {:.0f} units {}, never drawn {}{}; unreadable {}",
-				total, drawn, blended, seen, moving, kAuditRange, inView, suspects.size(), fadeNodes, unreadable);
+			logger::info("chunk audit: {} chunks, drawn at least once {} (blended {}), moving for TAA {} (should be 0); on screen within {:.0f} "
+						 "units and expected drawn {}, never drawn {}{}; unreadable {}",
+				total, drawn, blended, moving, kAuditRange, inView, suspects.size(), fadeNodes, unreadable);
 			const auto count = std::min<std::size_t>(suspects.size(), 3);
 			std::partial_sort(suspects.begin(), suspects.begin() + count, suspects.end(), [](const Suspect& a_l, const Suspect& a_r) { return a_l.distance < a_r.distance; });
 			for (std::size_t i = 0; i < count; ++i) {
 				const auto& s = suspects[i];
-				logger::warn("  on screen but never drawn: cell {:08X}, {:.0f} units from the camera, {} meshes (first reference {:08X}), {} tris",
-					s.cell, s.distance, s.record->members, s.record->refs.empty() ? 0u : s.record->refs.front(), s.record->triangles);
-			}
-
-			// The fade-node layout is checked at run time: plain chunks from here on if it leaves visible chunks undrawn.
-			if (undrawnSeen >= 3 && !g_fadeNodesBroken) {
-				g_fadeNodesBroken = true;
-				logger::error("{} chunks under fade nodes were found visible by the main view in 60+ frames, fully faded in, and never drawn: "
-							  "rebuilding every cell with plain chunks (no distance fade)",
-					undrawnSeen);
-				RevertAll();
-			}
-		}
-
-		// Each tick: count the chunks the last frame's main view found visible (for the audit's fade-node check).
-		void CountSeen()
-		{
-			for (auto& [cell, state] : g_cells) {
-				if (!state.applied || state.applied->fallback) {
-					continue;
-				}
-				for (auto& record : state.applied->chunks) {
-					record.seen += Engine::SeenByMainView(record.Fed()) ? 1 : 0;
-				}
+				logger::warn("  on screen but never drawn: cell {:08X}, {:.0f} units from the camera, {} meshes (first reference {:08X}), {} tris, "
+							 "mesh '{}', material '{}', shader flags {:016X}",
+					s.cell, s.distance, s.record->members, s.record->refs.empty() ? 0u : s.record->refs.front(), s.record->triangles,
+					s.record->shape->name.c_str(), s.material ? s.material : "", s.shaderFlags);
 			}
 		}
 
@@ -1163,9 +1158,9 @@ namespace RC::Combine::Manager
 					registered += std::ranges::count_if(state.applied->chunks, &ChunkRecord::registered);
 				}
 			}
-			logger::info("previs: active in {} frames, {} chunks registered as its dynamic objects; group 0 drawn last frame: {} "
-						 "(yes: previs off, or suspended over the cull as CBRO classic does)",
-				std::exchange(g_previsFrames, 0), registered, g_group0Drawn ? "yes" : "no");
+			logger::info("previs: active in {} frames, {} chunks registered as its dynamic objects, {} found visible by its last main-view "
+						 "pass; group 0 drawn last frame: {} (yes: previs off, or suspended over the cull as CBRO classic does)",
+				std::exchange(g_previsFrames, 0), registered, PrevisFeeds() ? g_previsVisible : 0u, g_group0Drawn ? "yes" : "no");
 		}
 
 		// The blocked parts of the attached cells by class: what keeps references from being hidden whole and
@@ -1308,7 +1303,6 @@ namespace RC::Combine::Manager
 			}
 
 			WatchProbes();
-			CountSeen();
 
 			// Fallbacks from engine callbacks become full reverts here.
 			for (auto& [cell, state] : g_cells) {

@@ -445,7 +445,8 @@ namespace RC::Engine
 			}
 			a_out.passes = *Field<const void* const>(property, Offset::kRenderPasses) != nullptr;
 			a_out.alpha = *Field<const float>(property, Offset::kShaderAlpha);
-			a_out.seen = SeenByMainView(a_fadeNode ? static_cast<const RE::NiAVObject*>(a_fadeNode) : a_shape);
+			a_out.material = reinterpret_cast<const RE::NiObjectNET*>(property)->name.c_str();
+			a_out.shaderFlags = *Field<const std::uint64_t>(property, Offset::kShaderFlags);
 			const auto& now = a_shape->world;
 			const auto& before = a_shape->previousWorld;
 			a_out.moving = now.translate.x != before.translate.x || now.translate.y != before.translate.y ||

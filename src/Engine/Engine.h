@@ -73,7 +73,7 @@ namespace RC::Engine
 		inline constexpr std::uint64_t kAlwaysDraw = 1ull << 11;   // Block::Add forces the entry visible (FO4-ENGINE-NOTES 5.3)
 		inline constexpr std::uint64_t kNotVisible = 1ull << 39;   // previs / fade culler
 		inline constexpr std::uint64_t kNoShadow = 1ull << 40;     // clear = shadow caster
-		inline constexpr std::uint64_t kAccumulated = 1ull << 42;  // a main view found it visible (SeenByMainView)
+		inline constexpr std::uint64_t kAccumulated = 1ull << 42;  // a cull found it visible (SeenByMainView)
 		inline constexpr std::uint64_t kMeshLOD = 1ull << 12;       // gates BSFadeNode::DetermineMeshLODLevel
 		inline constexpr std::uint64_t kFadeComplete = 1ull << 37;  // a fade node's fade-in is done (FO4-ENGINE-NOTES 7.8)
 		inline constexpr std::uint64_t kPickChildren = 1ull << 44;  // picking skips the node's bound, tests its children
@@ -174,18 +174,19 @@ namespace RC::Engine
 	{
 		bool  inView{ false };  // its fade node's OnVisible stamp is fresh (false without one: a mesh's bit 42 is no
 		                        // signal at the game tick, FO4-ENGINE-NOTES 5.3)
-		bool  seen{ false };    // a main view found it visible in the last frame (SeenByMainView)
 		bool  moving{ false };  // previousWorld differs from world: TAA reads a motion (FO4-ENGINE-NOTES 7.10)
 		bool  passes{ false };  // render passes exist: it has been drawn
 		float alpha{ 1.0F };    // draw-time alpha (below 1: the blended path)
 		float fade{ 1.0F };     // its fade node's currentFade (1 without one)
 		bool  owner{ true };    // the mesh takes its fade alpha from its own fade node
+		const char*   material{ nullptr };  // the shader property's name (the material path), for the log
+		std::uint64_t shaderFlags{ 0 };
 	};
 	[[nodiscard]] bool ReadChunkView(const RE::NiAVObject* a_shape, const RE::BSFadeNode* a_fadeNode, ChunkView& a_out) noexcept;
 
-	// Flag bit 42 of a previs dynamic object (or of a group-0 entry): set when a main view found it visible in the
-	// last frame, by previs's dynamic-object pass or by group 0's finish loop (FO4-ENGINE-NOTES 5.2, 5.5d). Not for
-	// meshes outside those paths: culling processes clear their bit too (5.3).
+	// Flag bit 42 of a previs dynamic object, read right after the previs query: whether the query's main-view pass
+	// found it visible this frame (FO4-ENGINE-NOTES 5.5d). Later passes of the frame rewrite the bit (group 0's finish
+	// loop, lamp and CBRO culls), so at the game tick it says nothing about the main view (5.2).
 	[[nodiscard]] bool SeenByMainView(const RE::NiAVObject* a_object) noexcept;
 
 	// Previs. PrevisEnabled is the wish (QWantEnabled); PrevisActive is what the cull uses (QEnabled: wished, INI,
