@@ -1,0 +1,35 @@
+#pragma once
+
+namespace RC
+{
+	// RuntimeCombiner.ini next to the DLL. Missing keys keep these defaults.
+	struct Settings
+	{
+		// [General]
+		bool          enabled{ true };
+		bool          disablePrecombines{ true };  // switch the engine's precombines off at startup (bUseCombinedObjects)
+		bool          apply{ true };               // false: gather and bake, log, change nothing in the scene
+		std::uint32_t toggleHotkey{ 114 };         // virtual-key code of the on/off switch (114 = F3, 0 = unbound)
+		bool          notify{ true };              // HUD notice when the switch is used
+
+		// [Combine]
+		float         chunkSize{ 1024.0F };      // grid cell size (game units) that groups meshes into one combined mesh
+		float         maxShapeRadius{ 2048.0F };  // bigger meshes stay as they are
+		std::uint32_t minShapesPerChunk{ 2 };     // a combined mesh replaces at least this many meshes
+		std::uint32_t settleFrames{ 45 };         // frames without 3D changes in a cell before it is (re)combined
+		float         gatherBudgetMs{ 2.0F };     // main-thread time per frame for collecting cells
+		bool          chunkFadeNodes{ true };     // each chunk under its own BSFadeNode, fading like its originals; off: in the container
+
+		// [Debug]
+		bool          logCells{ true };              // one line per combined cell
+		std::uint32_t watchdogRefsPerFrame{ 512 };  // combined references re-checked per frame
+
+		void Load();
+
+		[[nodiscard]] static Settings& Get() noexcept
+		{
+			static Settings settings;
+			return settings;
+		}
+	};
+}

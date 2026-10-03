@@ -1,0 +1,10 @@
+build/
+.vs/
+external/CommonLibF4RD/
+pyghidra_mcp_projects/
+# Ignore large backup archives
+*.tar
+*.zip
+*.7z
+*.png
+*.md

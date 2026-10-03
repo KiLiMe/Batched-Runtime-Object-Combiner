@@ -1,0 +1,212 @@
+#pragma once
+
+// Engine access for Fallout 4 OG 1.10.163. Every id, offset and function here was read from the executable on
+// 2026-10-02 (CBRO's FO4-ENGINE-NOTES.md 7.2, 7.4, 7.5 record the facts and their sources). Ids are OG-only:
+// they resolve on 1.10.163 and fail safely (unknown id) elsewhere, so the plugin installs nothing there.
+
+namespace RC::Engine
+{
+	[[nodiscard]] constexpr REL::ID OG(std::uint64_t a_og) noexcept
+	{
+		return REL::ID{ a_og, REL::ID::INVALID_ID };
+	}
+
+	namespace Offset
+	{
+		// BSGeometry / BSTriShape
+		inline constexpr std::size_t kModelBound = 0x120;     // NiBound (local)
+		inline constexpr std::size_t kAlphaProperty = 0x130;  // NiAlphaProperty*
+		inline constexpr std::size_t kShaderProperty = 0x138; // BSShaderProperty*
+		inline constexpr std::size_t kSkinInstance = 0x140;
+		inline constexpr std::size_t kRendererData = 0x148;   // BSGraphics::TriShape* (refcount at +0x18)
+		inline constexpr std::size_t kVertexDesc = 0x150;
+		inline constexpr std::size_t kTriangles = 0x160;      // u32 drawn triangles
+		inline constexpr std::size_t kVertices = 0x164;       // u16
+		// BSGraphics::TriShape
+		inline constexpr std::size_t kVertexBuffer = 0x8;
+		inline constexpr std::size_t kIndexBuffer = 0x10;
+		// BSGraphics::Buffer
+		inline constexpr std::size_t kBufferData = 0x8;      // the CPU copy the engine keeps
+		inline constexpr std::size_t kBufferSize = 0x34;     // bytes
+		inline constexpr std::size_t kBufferPending = 0x44;  // creation requests still queued on the resource thread
+		// BSShaderProperty
+		inline constexpr std::size_t kShaderAlpha = 0x28;     // float: draw-time cache, below 1 = blended path (7.8)
+		inline constexpr std::size_t kShaderFlags = 0x30;     // u64
+		inline constexpr std::size_t kRenderPasses = 0x38;    // BSRenderPass* list, built when the mesh is drawn (7.7)
+		inline constexpr std::size_t kShaderFadeNode = 0x48;  // the BSFadeNode its fade alpha comes from (7.6)
+		inline constexpr std::size_t kShaderMaterial = 0x58;  // BSShaderMaterial*
+		inline constexpr std::size_t kShaderLODFade = 0x64;   // float, 1.0 except in object-LOD blocks (FO4-ENGINE-NOTES 7.8)
+		// BSShaderMaterial
+		inline constexpr std::size_t kMaterialAlpha = 0x80;   // float: the persistent alpha (+0x28 is a draw-time cache, 7.8)
+		// BSFadeNode (FO4-ENGINE-NOTES 7.8, 7.9)
+		inline constexpr std::size_t kFadeType = 0x11C;       // u8: LOD-mult type (fade table index)
+		inline constexpr std::size_t kFadeNear = 0x198;       // float: plain distances, ComputeFadeAmount's units
+		inline constexpr std::size_t kFadeFar = 0x19C;
+		// NiAlphaProperty
+		inline constexpr std::size_t kAlphaFlags = 0x28;      // u16, bit 0 = blending
+		inline constexpr std::size_t kAlphaThreshold = 0x2A;  // u8
+	}
+
+	// Shader property flag bits (Fallout4ShaderPropertyFlags1/2 in nif.xml; the engine's own checks agree: the
+	// precombine baker sets 37 when it inserts vertex colours, the combined-shape technique reads 57).
+	namespace ShaderFlag
+	{
+		inline constexpr std::uint64_t Bit(unsigned a_bit) noexcept { return 1ull << a_bit; }
+		// Shaders that move vertices, read model space, or render outside the opaque passes: never combined.
+		inline constexpr std::uint64_t kNotCombinable =
+			Bit(1) |                                   // skinned
+			Bit(2) | Bit(15) | Bit(16) |               // refraction
+			Bit(10) | Bit(18) | Bit(21) |              // face, hair, skin tint
+			Bit(12) |                                  // model-space normals
+			Bit(14) | Bit(33) | Bit(34) |              // landscape, LOD landscape, LOD objects
+			Bit(25) |                                  // tessellation
+			Bit(40) | Bit(47) |                        // dismemberment
+			Bit(42) | Bit(43) | Bit(44) | Bit(45) |    // grass
+			Bit(55) | Bit(60) |                        // menu screen, pipboy screen
+			Bit(61);                                   // tree animation
+	}
+
+	// NiAVObject flag bits.
+	namespace ObjectFlag
+	{
+		inline constexpr std::uint64_t kAppCulled = 1ull << 0;
+		inline constexpr std::uint64_t kAlwaysDraw = 1ull << 11;   // Block::Add forces the entry visible (FO4-ENGINE-NOTES 5.3)
+		inline constexpr std::uint64_t kNotVisible = 1ull << 39;   // previs / fade culler
+		inline constexpr std::uint64_t kNoShadow = 1ull << 40;     // clear = shadow caster
+		inline constexpr std::uint64_t kAccumulated = 1ull << 42;  // a main view found it visible (SeenByMainView)
+		inline constexpr std::uint64_t kMeshLOD = 1ull << 12;       // gates BSFadeNode::DetermineMeshLODLevel
+		inline constexpr std::uint64_t kFadeComplete = 1ull << 37;  // a fade node's fade-in is done (FO4-ENGINE-NOTES 7.8)
+		inline constexpr std::uint64_t kPickChildren = 1ull << 44;  // picking skips the node's bound, tests its children
+	}
+
+	template <class T = std::byte>
+	[[nodiscard]] inline T* Field(const void* a_base, std::size_t a_offset) noexcept
+	{
+		return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(a_base) + a_offset);
+	}
+
+	// Resolves every address once (Plugin load). False when one is missing: install nothing.
+	[[nodiscard]] bool Init();
+
+	// Exact-class tests (never subclasses).
+	[[nodiscard]] bool IsExactTriShape(const RE::NiAVObject* a_object) noexcept;
+	[[nodiscard]] bool IsExactNode(const RE::NiAVObject* a_object) noexcept;      // NiNode or BSFadeNode
+	[[nodiscard]] bool IsPlainNode(const RE::NiAVObject* a_object) noexcept;      // exactly NiNode
+	[[nodiscard]] bool IsLightingShader(const void* a_property) noexcept;         // BSLightingShaderProperty
+
+	// BSLightingShaderProperty::CanMerge (vtable slot 0x31): same flags, same material name, BSShaderMaterial::IsCopy,
+	// and the two lighting-specific values (+0xB8 colour, +0xC8 float).
+	[[nodiscard]] bool CanMerge(void* a_property, void* a_other);
+
+	// NiObject::Clone(): a deep copy (properties included); the renderer data is shared and its count raised.
+	[[nodiscard]] RE::NiAVObject* Clone(RE::NiAVObject* a_object);
+
+	// BSGraphics::Renderer::CreateTriShape: copies the data into new engine buffers (CPU copy kept) and queues
+	// their GPU creation on the resource thread. Returns a TriShape with one reference, owned by the caller.
+	[[nodiscard]] void* CreateTriShape(const void* a_vertices, std::uint32_t a_vertexBytes, std::uint64_t a_desc, const std::uint16_t* a_indices, std::uint32_t a_indexCount);
+	void                ReleaseTriShape(void* a_triShape);
+	[[nodiscard]] bool  TriShapeReady(const void* a_triShape) noexcept;
+
+	// Replaces a shape's renderer data (releasing the old one) and its counts.
+	void SetGeometry(RE::NiAVObject* a_shape, void* a_triShape, std::uint32_t a_vertices, std::uint32_t a_triangles);
+
+	// NiAVObject::Update(NiUpdateData&) for objects placed once that never move: world transforms and bounds down the
+	// subtree, then up the parents (what TESObjectCELL::AttachCombinedObjectArt runs after attaching a precombined
+	// chunk); then previousWorld = world on every object of the subtree. UpdateWorldData copies the old world into
+	// previousWorld before it computes the new one, and the deferred pre-pass draws TAA's motion vectors from the two
+	// (FO4-ENGINE-NOTES 7.10): after one Update a new object would move from wherever it was before placement.
+	void UpdateStatic(RE::NiAVObject* a_object);
+
+	// A plain NiNode made by the engine's constructor.
+	[[nodiscard]] RE::NiNode* NewNode(std::uint16_t a_children);
+
+	// A reference root's distance-fade setup: the range TESObjectCELL::AttachReference3D gave its BSFadeNode
+	// (ConfigureFadeNodeRange from its radius, FO4-ENGINE-NOTES 7.9) and its LOD-mult type. Invalid when the root is
+	// no fade node.
+	struct FadeRange
+	{
+		float        nearDistance{ 0.0F };  // +0x198, +0x19C: ComputeFadeAmount's units (distance x lodAdjust / mult)
+		float        farDistance{ 0.0F };
+		std::uint8_t type{ 0 };             // +0x11C
+		[[nodiscard]] bool Valid() const noexcept { return farDistance > 0.0F; }
+	};
+	[[nodiscard]] FadeRange ReadFadeRange(const RE::NiAVObject* a_root) noexcept;
+	// Where such a node starts fading out, in game units from the camera, with the current fade multipliers and the
+	// main camera's lodAdjust (ComputeFadeAmount, FO4-ENGINE-NOTES 7.9); infinity when it never fades out.
+	[[nodiscard]] float FadeStartDistance(const FadeRange& a_range) noexcept;
+	// The furthest a camera in the loaded grid's centre cell can be from loaded content (uGridsToLoad).
+	[[nodiscard]] float LoadedReach() noexcept;
+
+	// A BSFadeNode holding a_shape, set up the way LoadTask::ProcessTriShape sets up a precombined chunk's
+	// (FO4-ENGINE-NOTES 7.9), flag bits 44 and 12, with a_range as its fade range and type (the members'); without a
+	// valid one, the precombined chunk's range from uGridsToLoad. It starts at a_fade: 1 = faded in; below 1 its
+	// fade-in carries on from there (stamped as seen this frame, so the engine's 20-frame unseen rule doesn't snap
+	// it, 7.8). Its geometry list is built by the first Update after it is attached. Null on failure.
+	[[nodiscard]] RE::BSFadeNode* NewChunkFadeNode(RE::NiAVObject* a_shape, float a_fade, const FadeRange& a_range);
+
+	// How far a reference root's load fade-in has got: its BSFadeNode's currentFade, or 1 when it is complete or
+	// the root is no fade node (FO4-ENGINE-NOTES 7.8).
+	[[nodiscard]] float FadeIn(const RE::NiAVObject* a_root) noexcept;
+
+	// A probe: a childless BSFadeNode with the always-draw bit. Hung next to the containers, the scene walk files it
+	// whole into the same culling group, Block::Add forces it visible, and the main view's finish loop sets its flag
+	// bit 42 in every frame it processes that group (FO4-ENGINE-NOTES 5.3, 7.9). While previs feeds the main view
+	// that group is not processed and the bit stays clear. Faded in, with Init's endless fade range (it never
+	// fades). Null on failure.
+	[[nodiscard]] RE::BSFadeNode* NewProbe();
+	// Whether the main view processed the probe's group since the last call; clears the bit for the next one.
+	[[nodiscard]] bool TakeProbeSeen(RE::NiAVObject* a_probe) noexcept;
+
+	// The object's class name (NiRTTI), for the log.
+	[[nodiscard]] const char* ClassName(const RE::NiAVObject* a_object);
+
+	// Attached cells: the interior, or the exterior grid's attached cells (TES::gridCells; the same reading as
+	// CBRO's scene survey).
+	[[nodiscard]] std::vector<RE::TESObjectCELL*> LoadedCells();
+	[[nodiscard]] bool                            InInterior() noexcept;  // TES's interior cell is set (portal culling)
+
+	// The engine's precombine switch ([General] bUseCombinedObjects), read at every cell load.
+	[[nodiscard]] bool PrecombinesEnabled() noexcept;
+	void               SetPrecombinesEnabled(bool a_enabled) noexcept;
+
+	// What the renderer made of one chunk at the last cull (read only, under SEH; FO4-ENGINE-NOTES 5.3, 7.6-7.9).
+	struct ChunkView
+	{
+		bool  inView{ false };  // its fade node's OnVisible stamp is fresh (false without one: a mesh's bit 42 is no
+		                        // signal at the game tick, FO4-ENGINE-NOTES 5.3)
+		bool  seen{ false };    // a main view found it visible in the last frame (SeenByMainView)
+		bool  moving{ false };  // previousWorld differs from world: TAA reads a motion (FO4-ENGINE-NOTES 7.10)
+		bool  passes{ false };  // render passes exist: it has been drawn
+		float alpha{ 1.0F };    // draw-time alpha (below 1: the blended path)
+		float fade{ 1.0F };     // its fade node's currentFade (1 without one)
+		bool  owner{ true };    // the mesh takes its fade alpha from its own fade node
+	};
+	[[nodiscard]] bool ReadChunkView(const RE::NiAVObject* a_shape, const RE::BSFadeNode* a_fadeNode, ChunkView& a_out) noexcept;
+
+	// Flag bit 42 of a previs dynamic object (or of a group-0 entry): set when a main view found it visible in the
+	// last frame, by previs's dynamic-object pass or by group 0's finish loop (FO4-ENGINE-NOTES 5.2, 5.5d). Not for
+	// meshes outside those paths: culling processes clear their bit too (5.3).
+	[[nodiscard]] bool SeenByMainView(const RE::NiAVObject* a_object) noexcept;
+
+	// Previs. PrevisEnabled is the wish (QWantEnabled); PrevisActive is what the cull uses (QEnabled: wished, INI,
+	// not suspended). While it is active the main view draws previs's per-frame records instead of group 0
+	// (FO4-ENGINE-NOTES 5.3, 5.5b).
+	[[nodiscard]] bool PrevisEnabled();
+	[[nodiscard]] bool PrevisActive();
+
+	// ---- previs dynamic objects (FO4-ENGINE-NOTES 5.5d) -------------------------------------------------------------
+	// MultiCellVisibilityData::RegisterDynamicObject / UnregisterDynamicObject, what a reference outside its cell's
+	// previs list gets for its 3D (all of them with precombines off). While previs is active, every frame's query
+	// tests each registered object (AppCulled ones are skipped) and adds its visible meshes to the main view, the
+	// sun's cascades and the precipitation map; a fade node is faded as the main view would. Both calls only queue
+	// the change for the engine's next MultiCellVisibilityData::Update. The engine keeps a raw pointer: the caller
+	// keeps the object alive while it is registered (the queued removal holds it until the engine lets go).
+	// False when previs's visibility object doesn't exist.
+	[[nodiscard]] bool RegisterPrevisObject(RE::NiAVObject* a_object) noexcept;
+	void               UnregisterPrevisObject(RE::NiAVObject* a_object) noexcept;
+
+	// Wraps the previs query call at Render_PreUI+0x80 (checked to be the engine's own call first): a_after runs
+	// right after the query, on the main thread, before the cull. False when the site isn't what was expected, or an
+	// address of the previs dynamic objects is missing.
+	[[nodiscard]] bool InstallPrevisQueryHook(void (*a_after)());
+}
