@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <tuple>
 
 #include <excpt.h>
@@ -28,52 +30,107 @@ namespace RC::Bake
 			std::int32_t x, y, z;
 			auto         operator<=>(const Key&) const = default;
 		};
+
+		Chunk SoloOf(std::span<const Member> a_members, std::uint32_t a_index)
+		{
+			Chunk solo;
+			solo.members.push_back(a_index);
+			solo.solo = true;
+			std::copy_n(a_members[a_index].center, 3, solo.origin);
+			return solo;
+		}
+
+		// One greedy pass: a seed takes every free candidate whose bound centre lies within a_radius of its own, at most
+		// kMaxVertices vertices. Clusters of at least a_minMembers go to a_chunks; the members of smaller ones are
+		// returned. The candidates are bucketed in cells of the radius, so the 3x3x3 cells around a seed's hold every
+		// one in reach.
+		std::vector<std::uint32_t> ClusterPass(std::span<const Member> a_members, std::vector<std::uint32_t> a_candidates, float a_radius,
+			std::uint32_t a_minMembers, std::vector<Chunk>& a_chunks)
+		{
+			const auto cellOf = [&](const Member& a_m) {
+				return Key{ static_cast<std::int32_t>(std::floor(a_m.center[0] / a_radius)), static_cast<std::int32_t>(std::floor(a_m.center[1] / a_radius)),
+					static_cast<std::int32_t>(std::floor(a_m.center[2] / a_radius)) };
+			};
+			std::map<Key, std::vector<std::uint32_t>> cells;
+			for (const auto index : a_candidates) {
+				cells[cellOf(a_members[index])].push_back(index);
+			}
+			// Seeds in cell order, along x inside a cell: deterministic, and neighbours seed neighbours.
+			std::ranges::sort(a_candidates, [&](std::uint32_t a_lhs, std::uint32_t a_rhs) {
+				const auto lhs = cellOf(a_members[a_lhs]);
+				const auto rhs = cellOf(a_members[a_rhs]);
+				return lhs != rhs ? lhs < rhs : a_members[a_lhs].center[0] < a_members[a_rhs].center[0];
+			});
+
+			std::vector<std::uint32_t> alone;
+			std::vector<bool>          taken(a_members.size(), false);
+			for (const auto seed : a_candidates) {
+				if (taken[seed]) {
+					continue;
+				}
+				const auto&   s = a_members[seed];
+				const auto    home = cellOf(s);
+				Chunk         chunk;
+				std::uint32_t vertices = 0;
+				for (std::int32_t dx = -1; dx <= 1; ++dx) {
+					for (std::int32_t dy = -1; dy <= 1; ++dy) {
+						for (std::int32_t dz = -1; dz <= 1; ++dz) {
+							const auto found = cells.find(Key{ home.x + dx, home.y + dy, home.z + dz });
+							if (found == cells.end()) {
+								continue;
+							}
+							for (const auto index : found->second) {
+								const auto& m = a_members[index];
+								const float d[3]{ m.center[0] - s.center[0], m.center[1] - s.center[1], m.center[2] - s.center[2] };
+								if (taken[index] || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > a_radius * a_radius || vertices + m.vertexCount > kMaxVertices) {
+									continue;
+								}
+								taken[index] = true;
+								chunk.members.push_back(index);
+								vertices += m.vertexCount;
+							}
+						}
+					}
+				}
+				if (chunk.members.size() >= a_minMembers) {
+					std::ranges::sort(chunk.members);
+					a_chunks.push_back(std::move(chunk));
+				} else {
+					alone.insert(alone.end(), chunk.members.begin(), chunk.members.end());
+				}
+			}
+			return alone;
+		}
 	}
 
-	std::vector<Chunk> Cluster(std::span<const Member> a_members, float a_cellSize, std::uint32_t a_minMembers)
+	std::vector<Chunk> Solos(std::span<const Member> a_members)
 	{
-		std::vector<std::pair<Key, std::uint32_t>> keyed;
-		keyed.reserve(a_members.size());
+		std::vector<Chunk> solos;
+		for (std::uint32_t i = 0; i < a_members.size(); ++i) {
+			solos.push_back(SoloOf(a_members, i));
+		}
+		return solos;
+	}
+
+	std::vector<Chunk> Cluster(std::span<const Member> a_members, float a_chunkSize, std::uint32_t a_minMembers)
+	{
+		std::vector<std::uint32_t> candidates;
 		for (std::uint32_t i = 0; i < a_members.size(); ++i) {
 			const auto& m = a_members[i];
-			if (m.vertexCount == 0 || m.vertexCount > kMaxVertices || m.triangleCount == 0) {
-				continue;
+			if (m.vertexCount != 0 && m.vertexCount <= kMaxVertices && m.triangleCount != 0) {
+				candidates.push_back(i);
 			}
-			keyed.push_back({ Key{ static_cast<std::int32_t>(std::floor(m.center[0] / a_cellSize)),
-								  static_cast<std::int32_t>(std::floor(m.center[1] / a_cellSize)),
-								  static_cast<std::int32_t>(std::floor(m.center[2] / a_cellSize)) },
-				i });
 		}
-		std::ranges::sort(keyed, [&](const auto& a_lhs, const auto& a_rhs) {
-			if (a_lhs.first != a_rhs.first) {
-				return a_lhs.first < a_rhs.first;
-			}
-			// Within a grid cell, neighbours along x end up in the same split.
-			return a_members[a_lhs.second].center[0] < a_members[a_rhs.second].center[0];
-		});
-
+		// Compact clusters first, within half the chunk size: about the precombined chunks' typical size. The stragglers
+		// get a second pass within twice the chunk size (about a cell; precombined chunks reach bound radius 5,200): left
+		// as solo clones they were 10,461 of Runtime Combiner's 22,473 objects against 18,971 precombined chunks (run 20).
 		std::vector<Chunk> chunks;
-		Chunk              current;
-		std::uint32_t      vertices = 0;
-		Key                currentKey{};
-		const auto         flush = [&]() {
-            if (current.members.size() >= a_minMembers) {
-                chunks.push_back(std::move(current));
-            }
-            current = Chunk{};
-            vertices = 0;
-		};
-		for (const auto& [key, index] : keyed) {
-			const auto count = a_members[index].vertexCount;
-			if (!current.members.empty() && (key != currentKey || vertices + count > kMaxVertices)) {
-				flush();
-			}
-			currentKey = key;
-			current.members.push_back(index);
-			vertices += count;
-		}
-		if (!current.members.empty()) {
-			flush();
+		auto               alone = ClusterPass(a_members, std::move(candidates), a_chunkSize * 0.5F, a_minMembers, chunks);
+		alone = ClusterPass(a_members, std::move(alone), a_chunkSize * 2.0F, a_minMembers, chunks);
+
+		std::vector<Chunk> solos;
+		for (const auto index : alone) {
+			solos.push_back(SoloOf(a_members, index));
 		}
 
 		// The origin is the centre of the members' bounding box: the smallest offsets, the finest position steps.
@@ -91,11 +148,16 @@ namespace RC::Bake
 				chunk.origin[i] = 0.5F * (lo[i] + hi[i]);
 			}
 		}
+		std::ranges::move(solos, std::back_inserter(chunks));
 		return chunks;
 	}
 
 	bool Build(const Vertex::Layout& a_from, const Vertex::Layout& a_to, std::span<const Member> a_members, Chunk& a_chunk, std::uint32_t a_minMembers)
 	{
+		if (a_chunk.solo) {
+			a_chunk.baked = a_chunk.members;
+			return true;
+		}
 		if (!Vertex::Convertible(a_from, a_to)) {
 			return false;
 		}

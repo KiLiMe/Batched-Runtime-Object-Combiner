@@ -47,11 +47,14 @@ namespace RC::Combine
 	struct Stats
 	{
 		std::array<std::uint32_t, static_cast<std::size_t>(Skip::kCount)> skips{};
+		std::array<std::uint32_t, static_cast<std::size_t>(Skip::kCount)> cloned{};  // not mergeable, drawn by a solo clone
 		std::uint32_t references{ 0 };       // in the cell's list
 		std::uint32_t candidates{ 0 };       // references with at least one captured mesh
 		std::uint32_t capturedShapes{ 0 };
 		std::uint32_t chunks{ 0 };           // combined meshes built
 		std::uint32_t bakedShapes{ 0 };      // meshes they replace
+		std::uint32_t solos{ 0 };            // meshes alone in their chunk: cloned as they are (Bake::Chunk::solo)
+		std::uint32_t precombinedRefs{ 0 };  // captured references the cell's precombines list (one fade class)
 		std::uint32_t triangles{ 0 };
 		std::uint32_t vertices{ 0 };
 		std::uint64_t vertexBytes{ 0 };      // their vertex data
@@ -64,6 +67,7 @@ namespace RC::Combine
 		std::vector<std::pair<const char*, std::uint32_t>> blockedClasses;
 
 		void Count(Skip a_skip) noexcept { ++skips[static_cast<std::size_t>(a_skip)]; }
+		void CountCloned(Skip a_skip) noexcept { ++cloned[static_cast<std::size_t>(a_skip)]; }
 		void CountBlocked(const char* a_class)
 		{
 			Count(Skip::kBlocked);
@@ -111,6 +115,7 @@ namespace RC::Combine
 		float                      fadeNear{ 0.0F };     // the furthest fade range among the members' references
 		float                      fadeFar{ 0.0F };
 		std::uint8_t               fadeType{ 0 };        // their fade nodes' LOD-mult type
+		bool                       cloneOnly{ false };   // members that can't merge: each is a solo chunk
 		std::vector<std::uint32_t> shapes;               // indices into Job::shapes, parallel to members
 		std::vector<Bake::Member>  members;
 		std::vector<Bake::Chunk>   chunks;               // the worker's output

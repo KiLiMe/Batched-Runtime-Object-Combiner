@@ -13,9 +13,9 @@ namespace RC
 		bool          notify{ true };              // HUD notice when the switch is used
 
 		// [Combine]
-		float         chunkSize{ 1024.0F };      // grid cell size (game units) that groups meshes into one combined mesh
+		float         chunkSize{ 1024.0F };      // combined mesh diameter (game units): members within half of it of a seed; stragglers: within twice it
 		float         maxShapeRadius{ 2048.0F };  // bigger meshes stay as they are
-		std::uint32_t minShapesPerChunk{ 2 };     // a combined mesh replaces at least this many meshes
+		std::uint32_t minShapesPerChunk{ 2 };     // a combined mesh replaces at least this many meshes; fewer: solo clones
 		std::uint32_t settleFrames{ 45 };         // frames without 3D changes in a cell before it is (re)combined
 		float         gatherBudgetMs{ 2.0F };     // main-thread time per frame for collecting cells
 		bool          chunkFadeNodes{ true };     // each chunk under its own BSFadeNode, fading like its originals; off: in the container

@@ -56,6 +56,7 @@ namespace RC::Combine::Manager
 			std::uint32_t                    formID{ 0 };
 			World                            world;
 			std::uint32_t                    children{ kNoChildCount };  // a hidden node root's child count
+			bool                             unregistered{ false };  // taken out of previs's dynamic objects while hidden
 		};
 
 		// What the watchdog found.
@@ -80,16 +81,27 @@ namespace RC::Combine::Manager
 			std::vector<std::uint32_t>    refs;                 // form IDs of the references it draws meshes of
 			std::uint32_t                 members{ 0 };
 			std::uint32_t                 triangles{ 0 };
-			std::uint64_t                 previsVisible{ 0 };   // the tick before the last query that found it visible
-			bool                          registered{ false };  // a previs dynamic object (Engine::RegisterPrevisObject)
+			std::uint32_t                 group{ 0 };  // index into Applied::groups: the node it hangs under
 
 			// What a view's culling group gets, and what previs tests: the fade node, or the mesh itself.
 			[[nodiscard]] RE::NiAVObject* Fed() const noexcept { return fadeNode ? static_cast<RE::NiAVObject*>(fadeNode) : shape.get(); }
 		};
 
+		// The chunks of one chunk-grid square under one parent hang under a plain node (a container, straight under
+		// the parent), and that node is what previs tests: its query recurses into a dynamic object's children only
+		// when the object's bound is visible, so an off-screen square costs one test per pass instead of one per chunk
+		// (FO4-ENGINE-NOTES 5.5d).
+		struct ChunkGroup
+		{
+			RE::NiPointer<RE::NiNode> node;  // also in Applied::containers
+			std::uint64_t             previsVisible{ 0 };   // the tick before the last query that found it visible
+			bool                      registered{ false };  // a previs dynamic object (Engine::RegisterPrevisObject)
+		};
+
 		struct Applied
 		{
 			std::vector<Container>   containers;
+			std::vector<ChunkGroup>  groups;
 			std::vector<ChunkRecord> chunks;
 			std::vector<Hidden>      hidden;
 			std::uint64_t            frame{ 0 };         // applied at this tick
@@ -143,12 +155,31 @@ namespace RC::Combine::Manager
 		bool          g_previsPaused{ false };  // previs active and no query hook: originals shown
 		bool          g_cbroLoaded{ false };    // CBRO is loaded (read at the first tick)
 		bool          g_previsHook{ false };    // the previs query hook is in (Engine::InstallPrevisQueryHook)
+		bool          g_resetHook{ false };     // the game-reset hook is in (Engine::InstallGameResetHook)
+		bool          g_configuredPrecombines{ true };  // the switch as the game's INIs set it (read at kGameDataReady)
+		// What F3 wants the precombine switch to be, written at the next save load (-1: no change). Only then is no
+		// cell loaded under the old value (FO4-ENGINE-NOTES 7.12).
+		std::atomic<int> g_precombinesNext{ -1 };
 		bool          g_keyDown{ false };
 		std::size_t   g_watchCursor{ 0 };
 		std::atomic<DWORD> g_mainThread{ 0 };  // the thread running PlayerCharacter::Update (set by the first tick)
 		std::atomic<bool>  g_resetPending{ false };
 		std::uintptr_t g_originalUpdate{ 0 };
 		Clock::time_point g_lastSummary{};
+		constexpr auto    kSummaryInterval = std::chrono::seconds(10);
+
+		// Frame times between ticks (gaps over a second, loading screens, left out) and the tick's own cost, per
+		// summary interval: the log's FPS for each state of the A/B.
+		struct FrameTimes
+		{
+			std::uint32_t frames{ 0 };
+			double        frameMs{ 0.0 };
+			double        frameMax{ 0.0 };
+			double        tickMs{ 0.0 };
+			double        tickMax{ 0.0 };
+		};
+		FrameTimes        g_frameTimes;
+		Clock::time_point g_lastTick{};
 		std::uint64_t g_blockedPrinted{ 0 };  // hash of the blocked-class totals last logged
 
 		// Probe hysteresis (ticks): a cell's chunks go after this many frames in a row without a drawn probe, and
@@ -160,7 +191,8 @@ namespace RC::Combine::Manager
 
 		std::uint64_t g_previsTick{ 0 };       // the tick of the last query that ran with previs active
 		std::uint64_t g_previsFrames{ 0 };     // queries that ran with previs active, since the last summary
-		std::uint32_t g_previsVisible{ 0 };    // chunks the last query's main-view pass found visible
+		std::uint32_t g_previsVisible{ 0 };    // chunk groups the last query's main-view pass found visible
+		bool          g_previsVisibleRead{ false };  // ... read: previs drew the main view
 		bool          g_group0Drawn{ false };  // the last tick saw a probe the main view drew
 
 		// ---- bake thread ---------------------------------------------------------------------------------------
@@ -182,7 +214,7 @@ namespace RC::Combine::Manager
 				const auto  start = Clock::now();
 				const auto& settings = Settings::Get();
 				for (auto& bucket : job->buckets) {
-					bucket.chunks = Bake::Cluster(bucket.members, settings.chunkSize, settings.minShapesPerChunk);
+					bucket.chunks = bucket.cloneOnly ? Bake::Solos(bucket.members) : Bake::Cluster(bucket.members, settings.chunkSize, settings.minShapesPerChunk);
 					for (auto& chunk : bucket.chunks) {
 						if (!Bake::Build(bucket.layout, bucket.chunkLayout, bucket.members, chunk, settings.minShapesPerChunk)) {
 							chunk.vertexCount = 0;
@@ -236,8 +268,25 @@ namespace RC::Combine::Manager
 			a_state.lastChange = g_frame;
 		}
 
-		// Shows the originals again and hides the chunks: flag writes only, safe inside engine callbacks. Each chunk is
-		// hidden itself too: previs tests its dynamic objects by their own flag, not their parents' (5.5d).
+		// A hidden root goes back into previs's dynamic objects only while it is still its reference's 3D in an
+		// attached cell: the engine unregisters a reference's 3D when it unloads or its cell detaches, and the set keeps
+		// raw pointers (FO4-ENGINE-NOTES 5.5d).
+		void Reregister(Hidden& a_hidden)
+		{
+			if (!std::exchange(a_hidden.unregistered, false)) {
+				return;
+			}
+			const auto ref = a_hidden.ref.get();
+			const auto root = a_hidden.root.get();
+			const auto cell = ref ? ref->parentCell : nullptr;
+			if (ref && ref->loadedData && ref->loadedData->data3D.get() == root && root->parent && cell &&
+				cell->cellState.get() == RE::TESObjectCELL::CELL_STATE::kAttached) {
+				(void)Engine::RegisterPrevisObject(root);
+			}
+		}
+
+		// Shows the originals again and hides the chunks (main thread, the tick). Each group and chunk is hidden itself
+		// too: previs tests its dynamic objects and their children by their own flag, not their parents' (5.5d).
 		void Fallback(CellState& a_state)
 		{
 			const auto applied = a_state.applied.get();
@@ -249,6 +298,11 @@ namespace RC::Combine::Manager
 					container.node->SetAppCulled(true);
 				}
 			}
+			for (auto& group : applied->groups) {
+				if (group.node && !group.node->GetAppCulled()) {
+					group.node->SetAppCulled(true);
+				}
+			}
 			for (auto& record : applied->chunks) {
 				if (const auto fed = record.Fed(); fed && !fed->GetAppCulled()) {
 					fed->SetAppCulled(true);
@@ -258,13 +312,14 @@ namespace RC::Combine::Manager
 				if (hidden.object && hidden.object->GetAppCulled()) {
 					hidden.object->SetAppCulled(false);
 				}
+				Reregister(hidden);
 			}
 			applied->fallback = true;
 		}
 
 		// Fallback, then takes the chunks out of previs and the scene and drops every reference held (main thread,
-		// outside engine callbacks that walk the parent's children). The engine's queued removal keeps each chunk
-		// alive until previs lets go of it (FO4-ENGINE-NOTES 5.5d).
+		// outside engine callbacks that walk the parent's children). The engine's queued removal keeps each group, and
+		// the chunks it holds, alive until previs lets go of it (FO4-ENGINE-NOTES 5.5d).
 		void Revert(CellState& a_state)
 		{
 			if (!a_state.applied) {
@@ -272,9 +327,9 @@ namespace RC::Combine::Manager
 			}
 			Fallback(a_state);
 			auto applied = std::move(a_state.applied);
-			for (auto& record : applied->chunks) {
-				if (std::exchange(record.registered, false)) {
-					Engine::UnregisterPrevisObject(record.Fed());
+			for (auto& group : applied->groups) {
+				if (std::exchange(group.registered, false)) {
+					Engine::UnregisterPrevisObject(group.node.get());
 				}
 			}
 			for (const auto& hidden : applied->hidden) {
@@ -435,12 +490,12 @@ namespace RC::Combine::Manager
 			return editorID && *editorID ? std::format("{:08X} {}", a_formID, editorID) : std::format("{:08X}", a_formID);
 		}
 
-		std::string SkipSummary(const Stats& a_stats)
+		std::string SkipSummary(const std::array<std::uint32_t, static_cast<std::size_t>(Skip::kCount)>& a_counts)
 		{
 			std::string text;
-			for (std::size_t i = 0; i < a_stats.skips.size(); ++i) {
-				if (a_stats.skips[i]) {
-					text += std::format("{}{} {}", text.empty() ? "" : ", ", SkipName(static_cast<Skip>(i)), a_stats.skips[i]);
+			for (std::size_t i = 0; i < a_counts.size(); ++i) {
+				if (a_counts[i]) {
+					text += std::format("{}{} {}", text.empty() ? "" : ", ", SkipName(static_cast<Skip>(i)), a_counts[i]);
 				}
 			}
 			return text.empty() ? "none"s : text;
@@ -453,10 +508,12 @@ namespace RC::Combine::Manager
 			}
 			const auto& s = a_job.stats;
 			logger::info(
-				"cell {} {}: {} references, {} with meshes captured ({} meshes); {} chunks replace {} meshes ({} tris, {} verts, {:.1f} MB); "
-				"{} references hidden whole, {} partly; gather {:.2f} ms, bake {:.2f} ms (worker), apply {:.2f} ms; left out: {}",
-				CellName(a_job.cell, a_job.cellFormID), a_what, s.references, s.candidates, s.capturedShapes, s.chunks, s.bakedShapes,
-				s.triangles, s.vertices, static_cast<double>(s.vertexBytes) / (1 << 20), s.wholeRefs, s.partialRefs, s.gatherMs, s.bakeMs, s.applyMs, SkipSummary(s));
+				"cell {} {}: {} references, {} with meshes captured ({} meshes), {} of them listed as precombined; {} chunks replace {} meshes ({} tris, {} verts, {:.1f} MB), "
+				"{} meshes alone cloned as they are (not mergeable: {}); {} references hidden whole, {} partly; gather {:.2f} ms, bake {:.2f} ms "
+				"(worker), apply {:.2f} ms; left out: {}",
+				CellName(a_job.cell, a_job.cellFormID), a_what, s.references, s.candidates, s.capturedShapes, s.precombinedRefs, s.chunks, s.bakedShapes,
+				s.triangles, s.vertices, static_cast<double>(s.vertexBytes) / (1 << 20), s.solos, SkipSummary(s.cloned), s.wholeRefs, s.partialRefs,
+				s.gatherMs, s.bakeMs, s.applyMs, SkipSummary(s.skips));
 		}
 
 		// ---- previs --------------------------------------------------------------------------------------------
@@ -475,14 +532,25 @@ namespace RC::Combine::Manager
 			}
 			g_previsTick = g_frame;
 			++g_previsFrames;
+			// Read for the summary's audit and previs line only: in the frames just before it, not every frame. Only
+			// while previs draws the main view (group 0 undrawn): where CBRO draws group 0 it may skip the query, and
+			// the bits are then stale (CBRO v1.66, FO4-ENGINE-NOTES 5.5d).
+			if (Clock::now() - g_lastSummary < kSummaryInterval - std::chrono::milliseconds(200)) {
+				return;
+			}
+			g_previsVisibleRead = !g_group0Drawn;
+			if (!g_previsVisibleRead) {
+				return;
+			}
 			std::uint32_t visible = 0;
 			for (auto& [cell, state] : g_cells) {
 				if (!state.applied || state.applied->fallback) {
 					continue;
 				}
-				for (auto& record : state.applied->chunks) {
-					if (record.registered && Engine::SeenByMainView(record.Fed())) {
-						record.previsVisible = g_frame;
+				// The query sets bit 42 on the registered object only: a group, for all its chunks.
+				for (auto& group : state.applied->groups) {
+					if (group.registered && Engine::SeenByMainView(group.node.get())) {
+						group.previsVisible = g_frame;
 						++visible;
 					}
 				}
@@ -595,35 +663,53 @@ namespace RC::Combine::Manager
 
 			auto applied = std::make_unique<Applied>();
 			applied->frame = g_frame;
-			std::unordered_map<RE::NiNode*, RE::NiNode*> containers;
+			std::map<std::tuple<RE::NiNode*, std::int32_t, std::int32_t>, std::uint32_t> groups;  // (parent, square) -> group
+			const float groupSize = std::max(Settings::Get().chunkSize, 256.0F);
 			auto& stats = a_job.stats;
 
 			std::size_t chunkIndex = 0;
 			for (auto& bucket : a_job.buckets) {
 				for (auto& chunk : bucket.chunks) {
 					auto& triShape = a_job.triShapes[chunkIndex++];
-					if (!triShape) {
-						continue;
-					}
-					// The chunk's mesh is a clone of one member (its shader and alpha properties, flags and name)
-					// with the combined data in place of the member's.
-					const auto representative = a_job.shapes[bucket.shapes[chunk.baked.front()]].shape.get();
-					RE::NiPointer<RE::NiAVObject> clone{ Engine::Clone(representative) };
-					if (!clone || !Engine::IsExactTriShape(clone.get())) {
-						Engine::ReleaseTriShape(triShape);
-						triShape = nullptr;
-						continue;
-					}
-					Engine::SetGeometry(clone.get(), triShape, chunk.vertexCount, chunk.triangleCount);
-					triShape = nullptr;  // owned by the clone now
-
-					auto& bound = *Engine::Field<RE::NiBound>(clone.get(), Engine::Offset::kModelBound);
-					bound.center = RE::NiPoint3{ chunk.boundCenter[0], chunk.boundCenter[1], chunk.boundCenter[2] };
-					bound.fRadius = chunk.boundRadius;
 					// Parent world rotation is identity with unit scale (Gather checks), so local = world - parent.
-					const auto& parentWorld = bucket.parent->world.translate;
-					clone->local.MakeIdentity();
-					clone->local.translate = RE::NiPoint3{ chunk.origin[0] - parentWorld.x, chunk.origin[1] - parentWorld.y, chunk.origin[2] - parentWorld.z };
+					const auto&                   parentWorld = bucket.parent->world.translate;
+					RE::NiPointer<RE::NiAVObject> clone;
+					if (chunk.solo) {
+						// A clone of its one mesh, sharing its data, where the mesh stands. With fade nodes an LOD mesh
+						// keeps its LOD levels: its fade node's level picks them, as the original's did.
+						if (chunk.baked.empty()) {
+							continue;
+						}
+						const auto& source = a_job.shapes[bucket.shapes[chunk.baked.front()]];
+						clone.reset(Engine::Clone(source.shape.get(), !fadeNodes));
+						if (!clone || !(Engine::IsExactTriShape(clone.get()) || Engine::IsExactMeshLODTriShape(clone.get()))) {
+							continue;
+						}
+						clone->local = source.world;
+						clone->local.translate = RE::NiPoint3{ source.world.translate.x - parentWorld.x, source.world.translate.y - parentWorld.y,
+							source.world.translate.z - parentWorld.z };
+					} else {
+						if (!triShape) {
+							continue;
+						}
+						// The chunk's mesh is a clone of one member (its shader and alpha properties, flags and name)
+						// with the combined data in place of the member's.
+						const auto representative = a_job.shapes[bucket.shapes[chunk.baked.front()]].shape.get();
+						clone.reset(Engine::Clone(representative));
+						if (!clone || !Engine::IsExactTriShape(clone.get())) {
+							Engine::ReleaseTriShape(triShape);
+							triShape = nullptr;
+							continue;
+						}
+						Engine::SetGeometry(clone.get(), triShape, chunk.vertexCount, chunk.triangleCount);
+						triShape = nullptr;  // owned by the clone now
+
+						auto& bound = *Engine::Field<RE::NiBound>(clone.get(), Engine::Offset::kModelBound);
+						bound.center = RE::NiPoint3{ chunk.boundCenter[0], chunk.boundCenter[1], chunk.boundCenter[2] };
+						bound.fRadius = chunk.boundRadius;
+						clone->local.MakeIdentity();
+						clone->local.translate = RE::NiPoint3{ chunk.origin[0] - parentWorld.x, chunk.origin[1] - parentWorld.y, chunk.origin[2] - parentWorld.z };
+					}
 					clone->flags.flags &= ~(Engine::ObjectFlag::kAppCulled | Engine::ObjectFlag::kNotVisible | Engine::ObjectFlag::kAccumulated);
 					clone->fadeAmount = 1.0F;
 					clone->meshLODFadingLevel = 0;
@@ -647,24 +733,30 @@ namespace RC::Combine::Manager
 						}
 					}
 
-					auto& container = containers[bucket.parent];
-					if (!container) {
-						const auto node = Engine::NewNode(8);
+					// The group is the container, straight under the references' parent: the scene walk adds each child
+					// of an exact NiNode there to group 0 on its own (FO4-ENGINE-NOTES 5.5b), so the cull and CBRO's
+					// shadow tests still judge chunk by chunk. One node level deeper, the walk filed whole groups, and
+					// the sun's nearest cascade took twice the precombines' draws (runs 15-18).
+					const auto cell = std::make_tuple(bucket.parent, static_cast<std::int32_t>(std::floor(chunk.origin[0] / groupSize)),
+						static_cast<std::int32_t>(std::floor(chunk.origin[1] / groupSize)));
+					auto [slot, added] = groups.try_emplace(cell, static_cast<std::uint32_t>(applied->groups.size()));
+					if (added) {
+						const auto node = Engine::NewNode(16);
 						if (!node) {
+							groups.erase(slot);
 							continue;
 						}
-						auto& entry = applied->containers.emplace_back();
-						entry.node.reset(node);
-						entry.parent = bucket.parent;
 						node->name = RE::BSFixedString("RuntimeCombiner");
 						node->local.MakeIdentity();
 						bucket.parent->AttachChild(node, false);  // appended: no empty slot of the parent is reused
-						container = node;
+						applied->containers.push_back({ RE::NiPointer<RE::NiNode>(node), bucket.parent });
+						applied->groups.push_back({ RE::NiPointer<RE::NiNode>(node) });
 					}
-					container->AttachChild(fadeNode ? static_cast<RE::NiAVObject*>(fadeNode.get()) : clone.get(), true);
+					applied->groups[slot->second].node->AttachChild(fadeNode ? static_cast<RE::NiAVObject*>(fadeNode.get()) : clone.get(), true);
 					auto& record = applied->chunks.emplace_back();
 					record.shape = clone;
 					record.fadeNode = fadeNode.get();
+					record.group = slot->second;
 					for (const auto member : chunk.baked) {
 						const auto formID = a_job.refs[a_job.shapes[bucket.shapes[member]].ref].formID;
 						if (std::ranges::find(record.refs, formID) == record.refs.end()) {
@@ -672,12 +764,16 @@ namespace RC::Combine::Manager
 						}
 					}
 					record.members = static_cast<std::uint32_t>(chunk.baked.size());
-					record.triangles = chunk.triangleCount;
+					record.triangles = chunk.solo ? bucket.members[chunk.baked.front()].triangleCount : chunk.triangleCount;
 
 					for (const auto member : chunk.baked) {
 						auto& source = a_job.shapes[bucket.shapes[member]];
 						source.baked = true;
 						++a_job.refs[source.ref].baked;
+					}
+					if (chunk.solo) {
+						++stats.solos;
+						continue;
 					}
 					++stats.chunks;
 					stats.bakedShapes += static_cast<std::uint32_t>(chunk.baked.size());
@@ -727,10 +823,17 @@ namespace RC::Combine::Manager
 
 			// While previs is active it draws the main view, the sun's cascades and the precipitation map from its
 			// per-frame query, not group 0. A static reference outside its cell's previs list (all of them with
-			// precombines off) is one of the query's dynamic objects, tested and drawn each frame: so is each chunk,
-			// in its originals' place (FO4-ENGINE-NOTES 5.5d).
-			for (auto& record : applied->chunks) {
-				record.registered = Engine::RegisterPrevisObject(record.Fed());
+			// precombines off) is one of the query's dynamic objects, tested and drawn each frame: so is each chunk
+			// group, in its originals' place; the query tests a group's chunks when the group is visible (5.5d).
+			for (auto& group : applied->groups) {
+				group.registered = Engine::RegisterPrevisObject(group.node.get());
+			}
+			// A root hidden whole is skipped by the query's test but still read in each of its three passes every frame:
+			// with ~25k of them the query took 8 ms a frame (run 13). It leaves the set while its chunks stand in.
+			for (auto& hidden : applied->hidden) {
+				if (hidden.object == hidden.root) {
+					hidden.unregistered = Engine::UnregisterIfDynamic(hidden.object.get());
+				}
 			}
 			stats.applyMs = Ms(start);
 			if (!applied->containers.empty()) {
@@ -1038,18 +1141,34 @@ namespace RC::Combine::Manager
 
 		// ---- frame ---------------------------------------------------------------------------------------------
 
+		// Off means the game as without Runtime Combiner: its precombines as configured. The engine reads the switch
+		// when a cell loads, so loaded cells keep the old value until the next save load (FO4-ENGINE-NOTES 7.12).
 		void Toggle()
 		{
 			g_active = !g_active;
+			const bool wanted = (g_active && Settings::Get().disablePrecombines) ? false : g_configuredPrecombines;
+			const bool change = g_resetHook && wanted != Engine::PrecombinesEnabled();
+			g_precombinesNext.store(change ? static_cast<int>(wanted) : -1);
+			const auto precombines = change ? std::format("; precombines {} after the next save load", wanted ? "back" : "replaced") : ""s;
 			if (g_active) {
 				for (auto& [cell, state] : g_cells) {
 					state.dirty = true;
 					state.lastChange = 0;  // settled: rebuild now
 				}
-				Notify("Runtime Combiner: on"s);
+				Notify("Runtime Combiner: on"s + precombines);
 			} else {
 				RevertAll();
-				Notify("Runtime Combiner: off (original meshes)"s);
+				Notify("Runtime Combiner: off (original meshes)"s + precombines);
+			}
+		}
+
+		// Inside Main::PerformGameReset, every cell cleared and purged, before the save's world loads.
+		void OnGameReset()
+		{
+			const int next = g_precombinesNext.exchange(-1);
+			if (next >= 0 && (next != 0) != Engine::PrecombinesEnabled()) {
+				Engine::SetPrecombinesEnabled(next != 0);
+				logger::info("save load: precombines switched {} (bUseCombinedObjects = {}) with no cell loaded", next ? "on" : "off", next);
 			}
 		}
 
@@ -1112,7 +1231,7 @@ namespace RC::Combine::Manager
 					foreign += view.owner ? 0 : 1;
 					filed += view.inView ? 1 : 0;
 					moving += view.moving ? 1 : 0;
-					const bool expected = frustumOnly || (previsDraws && g_frame - record.previsVisible <= 1);
+					const bool expected = frustumOnly || (previsDraws && g_frame - state.applied->groups[record.group].previsVisible <= 1);
 					if (camera && settled && expected && InView(*camera, record.shape->worldBound)) {
 						++inView;
 						if (!view.passes) {
@@ -1153,14 +1272,22 @@ namespace RC::Combine::Manager
 				return;
 			}
 			std::size_t registered = 0;
+			std::size_t unregistered = 0;
+			std::size_t chunks = 0;
 			for (const auto& [cell, state] : g_cells) {
 				if (state.applied) {
-					registered += std::ranges::count_if(state.applied->chunks, &ChunkRecord::registered);
+					registered += std::ranges::count_if(state.applied->groups, &ChunkGroup::registered);
+					chunks += state.applied->chunks.size();
+					unregistered += std::ranges::count_if(state.applied->hidden, &Hidden::unregistered);
 				}
 			}
-			logger::info("previs: active in {} frames, {} chunks registered as its dynamic objects, {} found visible by its last main-view "
-						 "pass; group 0 drawn last frame: {} (yes: previs off, or suspended over the cull as CBRO classic does)",
-				std::exchange(g_previsFrames, 0), registered, PrevisFeeds() ? g_previsVisible : 0u, g_group0Drawn ? "yes" : "no");
+			const auto visible = PrevisFeeds() && g_previsVisibleRead ? std::format("{} groups found visible by its last main-view pass", g_previsVisible) :
+			                                                            "its main-view verdicts not read (group 0 drew the main view)"s;
+			logger::info("previs: active in {} frames, {} dynamic objects (its query tests each every frame), of them {} chunk groups "
+						 "holding {} chunks; {} hidden originals taken out; {}; group 0 drawn last frame: {} (yes: previs off, or suspended "
+						 "over the cull as CBRO classic does)",
+				std::exchange(g_previsFrames, 0), Engine::PrevisDynamicObjects(), registered, chunks, unregistered, visible,
+				g_group0Drawn ? "yes" : "no");
 		}
 
 		// The blocked parts of the attached cells by class: what keeps references from being hidden whole and
@@ -1201,10 +1328,20 @@ namespace RC::Combine::Manager
 		void Summary()
 		{
 			const auto now = Clock::now();
-			if (g_cells.empty() || now - g_lastSummary < std::chrono::seconds(10)) {
+			if (g_cells.empty() || now - g_lastSummary < kSummaryInterval) {
 				return;
 			}
 			g_lastSummary = now;
+			std::uint32_t queries = 0;
+			const double  queryMs = Engine::TakePrevisQueryTime(queries);
+			const auto    times = std::exchange(g_frameTimes, {});
+			if (times.frames) {
+				logger::info("frames: {} at {:.2f} ms avg ({:.1f} FPS), slowest {:.1f} ms; Runtime Combiner's tick {:.3f} ms avg, slowest "
+							 "{:.2f} ms; previs query {:.3f} ms avg over {} calls ({}, precombines {})",
+					times.frames, times.frameMs / times.frames, 1000.0 * times.frames / times.frameMs, times.frameMax,
+					times.tickMs / times.frames, times.tickMax, queries ? queryMs / queries : 0.0, queries,
+					g_active ? "on" : "switched off", Engine::PrecombinesEnabled() ? "on" : "off");
+			}
 			std::size_t cells = 0, chunks = 0, hidden = 0, building = 0, blind = 0;
 			for (const auto& [cell, state] : g_cells) {
 				building += state.building ? 1 : 0;
@@ -1216,12 +1353,40 @@ namespace RC::Combine::Manager
 				}
 			}
 			const auto votes = Gather::Votes();
+			// The engine's own chunks and RC's, for the A/B: how many, and how big (a bound decides how often the sun's
+			// cascades file an object, run 17).
+			std::uint32_t      precombined = 0;
+			std::vector<float> engineRadii, mergedRadii, soloRadii;
+			for (const auto& [cell, state] : g_cells) {
+				precombined += Engine::PrecombinedChunks(cell, &engineRadii);
+				if (state.applied) {
+					for (const auto& record : state.applied->chunks) {
+						if (record.shape) {
+							(record.members > 1 ? mergedRadii : soloRadii).push_back(record.shape->worldBound.fRadius);
+						}
+					}
+				}
+			}
+			const auto sizes = [](std::vector<float>& a_radii) {
+				if (a_radii.empty()) {
+					return "none"s;
+				}
+				std::ranges::sort(a_radii);
+				double sum = 0.0;
+				for (const auto r : a_radii) {
+					sum += r;
+				}
+				return std::format("{} (radius mean {:.0f}, median {:.0f}, 90% under {:.0f}, max {:.0f})", a_radii.size(), sum / a_radii.size(),
+					a_radii[a_radii.size() / 2], a_radii[a_radii.size() * 9 / 10], a_radii.back());
+			};
+			logger::info("object sizes: combined chunks {}; solos {}; precombined chunks {}", sizes(mergedRadii), sizes(soloRadii), sizes(engineRadii));
 			logger::info(
 				"summary: {} of {} attached cells combined ({} building, {} not drawn by the main view), {} chunks in the scene, {} originals "
-				"hidden; {}{}{}precombines {}; applies {}, reverts {} (main view stopped drawing {}), discarded {}, watchdog {}, attached {}; "
-				"rotation check {} agree / {} disagree",
+				"hidden; {}{}{}precombines {} ({} precombined chunks attached){}; applies {}, reverts {} (main view stopped drawing {}), "
+				"discarded {}, watchdog {}, attached {}; rotation check {} agree / {} disagree",
 				cells, g_cells.size(), building, blind, chunks, hidden, g_active ? "" : "switched off, ", g_workshop ? "workshop mode, " : "",
-				g_previsPaused ? "previs active without the query hook (originals shown), " : "", Engine::PrecombinesEnabled() ? "on" : "off", g_totals.applies,
+				g_previsPaused ? "previs active without the query hook (originals shown), " : "", Engine::PrecombinesEnabled() ? "on" : "off", precombined,
+				g_precombinesNext.load() < 0 ? "" : g_precombinesNext.load() ? " (on after the next save load)" : " (off after the next save load)", g_totals.applies,
 				g_totals.reverts, g_totals.blind, g_totals.discarded, g_totals.watchdog, g_totals.attached, votes.agree, votes.disagree);
 			AuditChunks();
 			LogPrevis();
@@ -1324,6 +1489,7 @@ namespace RC::Combine::Manager
 		{
 			using func_t = void (*)(RE::PlayerCharacter*, float);
 			reinterpret_cast<func_t>(g_originalUpdate)(a_this, a_delta);
+			const auto start = Clock::now();
 			try {
 				Tick();
 			} catch (const std::exception& e) {
@@ -1332,6 +1498,18 @@ namespace RC::Combine::Manager
 					logger::error("tick failed ({}): combining stopped", e.what());
 				}
 			}
+			const auto   end = Clock::now();
+			const double frame = std::chrono::duration<double, std::milli>(start - g_lastTick).count();
+			if (g_lastTick != Clock::time_point{} && frame < 1000.0) {
+				const double tick = std::chrono::duration<double, std::milli>(end - start).count();
+				auto&        times = g_frameTimes;
+				++times.frames;
+				times.frameMs += frame;
+				times.frameMax = std::max(times.frameMax, frame);
+				times.tickMs += tick;
+				times.tickMax = std::max(times.tickMax, tick);
+			}
+			g_lastTick = start;
 		}
 	}
 
@@ -1345,11 +1523,18 @@ namespace RC::Combine::Manager
 		if (g_previsHook) {
 			logger::info("previs query hooked (Render_PreUI+0x80); chunks are registered as previs dynamic objects, previs stays as it is");
 		}
+		g_resetHook = Engine::InstallGameResetHook(&OnGameReset);
+		if (g_resetHook) {
+			logger::info("game reset hooked (Main::PerformGameReset+0x2ED): F3 changes the precombine switch at the next save load");
+		} else {
+			logger::warn("game reset not hooked: F3 only swaps chunks and originals; precombines stay as set at startup");
+		}
 	}
 
 	void OnGameDataReady()
 	{
 		const auto& settings = Settings::Get();
+		g_configuredPrecombines = Engine::PrecombinesEnabled();
 		if (settings.disablePrecombines) {
 			if (Engine::PrecombinesEnabled()) {
 				Engine::SetPrecombinesEnabled(false);

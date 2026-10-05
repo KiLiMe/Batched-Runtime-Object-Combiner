@@ -13,6 +13,8 @@ namespace RC::Engine
 
 	namespace Offset
 	{
+		// NiObjectNET
+		inline constexpr std::size_t kControllers = 0x18;     // NiTimeController* (NiPointer)
 		// BSGeometry / BSTriShape
 		inline constexpr std::size_t kModelBound = 0x120;     // NiBound (local)
 		inline constexpr std::size_t kAlphaProperty = 0x130;  // NiAlphaProperty*
@@ -20,8 +22,10 @@ namespace RC::Engine
 		inline constexpr std::size_t kSkinInstance = 0x140;
 		inline constexpr std::size_t kRendererData = 0x148;   // BSGraphics::TriShape* (refcount at +0x18)
 		inline constexpr std::size_t kVertexDesc = 0x150;
+		inline constexpr std::size_t kGeometryType = 0x158;   // u8: 3 BSTriShape, 5 BSMeshLODTriShape (FO4-ENGINE-NOTES 7.11)
 		inline constexpr std::size_t kTriangles = 0x160;      // u32 drawn triangles
 		inline constexpr std::size_t kVertices = 0x164;       // u16
+		inline constexpr std::size_t kLODSizes = 0x170;       // BSMeshLODTriShape: u32[3] triangle segments (7.11)
 		// BSGraphics::TriShape
 		inline constexpr std::size_t kVertexBuffer = 0x8;
 		inline constexpr std::size_t kIndexBuffer = 0x10;
@@ -90,16 +94,21 @@ namespace RC::Engine
 
 	// Exact-class tests (never subclasses).
 	[[nodiscard]] bool IsExactTriShape(const RE::NiAVObject* a_object) noexcept;
+	[[nodiscard]] bool IsExactMeshLODTriShape(const RE::NiAVObject* a_object) noexcept;
 	[[nodiscard]] bool IsExactNode(const RE::NiAVObject* a_object) noexcept;      // NiNode or BSFadeNode
 	[[nodiscard]] bool IsPlainNode(const RE::NiAVObject* a_object) noexcept;      // exactly NiNode
 	[[nodiscard]] bool IsLightingShader(const void* a_property) noexcept;         // BSLightingShaderProperty
+	[[nodiscard]] bool IsEffectShader(const void* a_property) noexcept;           // BSEffectShaderProperty
 
 	// BSLightingShaderProperty::CanMerge (vtable slot 0x31): same flags, same material name, BSShaderMaterial::IsCopy,
 	// and the two lighting-specific values (+0xB8 colour, +0xC8 float).
 	[[nodiscard]] bool CanMerge(void* a_property, void* a_other);
 
 	// NiObject::Clone(): a deep copy (properties included); the renderer data is shared and its count raised.
-	[[nodiscard]] RE::NiAVObject* Clone(RE::NiAVObject* a_object);
+	// With a_plain, a BSMeshLODTriShape's clone comes back a plain BSTriShape that draws all its triangles
+	// (FO4-ENGINE-NOTES 7.11): what a combined chunk built from it needs. Without, it stays a BSMeshLODTriShape that
+	// draws the LOD prefix its fade node's level picks.
+	[[nodiscard]] RE::NiAVObject* Clone(RE::NiAVObject* a_object, bool a_plain = true);
 
 	// BSGraphics::Renderer::CreateTriShape: copies the data into new engine buffers (CPU copy kept) and queues
 	// their GPU creation on the resource thread. Returns a TriShape with one reference, owned by the caller.
@@ -167,6 +176,14 @@ namespace RC::Engine
 
 	// The engine's precombine switch ([General] bUseCombinedObjects), read at every cell load.
 	[[nodiscard]] bool PrecombinesEnabled() noexcept;
+	// The cell's precombined references (extra 0xC5, ExtraCombinedRefs, built from its XCRI record whatever the
+	// precombine switch says; FO4-ENGINE-NOTES 7.12), or null. Main thread.
+	[[nodiscard]] const void* CombinedRefs(const RE::TESObjectCELL* a_cell) noexcept;
+	// Whether a_formID is one of them: a reference the precombines draw, with no fade of its own (7.9).
+	[[nodiscard]] bool InCombinedRefs(const void* a_combinedRefs, std::uint32_t a_formID) noexcept;
+	// The precombined chunks attached in a_cell (its loaded data's combined-object list, FO4-ENGINE-NOTES 7.12),
+	// their world-bound radii appended to a_radii when given.
+	[[nodiscard]] std::uint32_t PrecombinedChunks(const RE::TESObjectCELL* a_cell, std::vector<float>* a_radii = nullptr);
 	void               SetPrecombinesEnabled(bool a_enabled) noexcept;
 
 	// What the renderer made of one chunk at the last cull (read only, under SEH; FO4-ENGINE-NOTES 5.3, 7.6-7.9).
@@ -205,9 +222,22 @@ namespace RC::Engine
 	// False when previs's visibility object doesn't exist.
 	[[nodiscard]] bool RegisterPrevisObject(RE::NiAVObject* a_object) noexcept;
 	void               UnregisterPrevisObject(RE::NiAVObject* a_object) noexcept;
+	// Unregisters a_object only when it is in previs's dynamic-object set now (what the engine registered: a
+	// reference's 3D outside its cell's previs list). True when it was. Main thread (the set changes in
+	// MultiCellVisibilityData::Update, at the start of the frame's render).
+	[[nodiscard]] bool UnregisterIfDynamic(RE::NiAVObject* a_object) noexcept;
+	// Objects in the dynamic-object set, which the previs query tests every frame in three views.
+	[[nodiscard]] std::uint32_t PrevisDynamicObjects() noexcept;
 
 	// Wraps the previs query call at Render_PreUI+0x80 (checked to be the engine's own call first): a_after runs
 	// right after the query, on the main thread, before the cull. False when the site isn't what was expected, or an
 	// address of the previs dynamic objects is missing.
 	[[nodiscard]] bool InstallPrevisQueryHook(void (*a_after)());
+	// Milliseconds the engine's previs query took since the last call, and how many times it ran (main thread).
+	[[nodiscard]] double TakePrevisQueryTime(std::uint32_t& a_calls) noexcept;
+
+	// Wraps the cell-buffer purge in Main::PerformGameReset (a save load or new game): a_after runs once every cell
+	// is cleared and purged, before the next world loads, the one point where the precombine switch may change
+	// (FO4-ENGINE-NOTES 7.12). False when the site isn't the engine's own call.
+	[[nodiscard]] bool InstallGameResetHook(void (*a_after)());
 }

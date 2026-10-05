@@ -185,8 +185,18 @@ namespace
 			members.push_back(m);
 		}
 		auto chunks = Bake::Cluster(members, 1024.0F, 2);
-		Check(chunks.size() == 1 && chunks[0].members.size() == 3, "three neighbours form one chunk, the far one is left alone");
-		if (chunks.size() == 1) {
+		Check(chunks.size() == 2 && chunks[0].members.size() == 3 && !chunks[0].solo, "three neighbours form one chunk");
+		Check(chunks.size() == 2 && chunks[1].solo && chunks[1].members.size() == 1 && chunks[1].members[0] == 3 && chunks[1].origin[0] == 50003.0F,
+			"the far one is a solo chunk at its bound centre, after the others");
+		if (chunks.size() == 2) {
+			Check(Bake::Build(layout, layout, members, chunks[1], 2) && chunks[1].baked.size() == 1 && chunks[1].vertexCount == 0, "a solo writes no data");
+		}
+		std::vector<Bake::Member> unmergeable = members;
+		unmergeable[1].vertexCount = 0;  // no CPU copy: still drawn by a clone
+		const auto solos = Bake::Solos(unmergeable);
+		Check(solos.size() == 4 && std::ranges::all_of(solos, &Bake::Chunk::solo) && solos[1].members[0] == 1 && solos[3].origin[0] == 50003.0F,
+			"Solos: one solo chunk per member, whatever its data, at its bound centre");
+		if (chunks.size() == 2) {
 			auto& chunk = chunks[0];
 			Check(Bake::Build(layout, layout, members, chunk, 2), "build");
 			Check(chunk.vertexCount == 9 && chunk.triangleCount == 3, "counts");
@@ -224,11 +234,35 @@ namespace
 		}
 		Check(split.size() == 2 && total == 30 && within, "vertex limit splits a grid cell");
 
+		// Clusters are compact, not grid cells: two meshes 100 apart across a multiple of 1024 form a chunk; one 1400
+		// away from both stays solo.
+		std::vector<Bake::Member> scattered;
+		for (const float x : { 1000.0F, 1100.0F, 2500.0F }) {
+			Bake::Member m = members[0];
+			m.center[0] = x;
+			scattered.push_back(m);
+		}
+		const auto compact = Bake::Cluster(scattered, 1024.0F, 2);
+		Check(compact.size() == 2 && !compact[0].solo && compact[0].members.size() == 2 && compact[1].solo && compact[1].members[0] == 2,
+			"neighbours across a grid line form a chunk, a mesh beyond half the chunk size stays apart");
+
+		// Stragglers get a second pass within twice the chunk size: two meshes 1500 apart form a chunk, one 3500 away
+		// from the nearest stays solo.
+		std::vector<Bake::Member> stragglers;
+		for (const float x : { 0.0F, 1500.0F, 5000.0F }) {
+			Bake::Member m = members[0];
+			m.center[0] = x;
+			stragglers.push_back(m);
+		}
+		const auto wide = Bake::Cluster(stragglers, 1024.0F, 2);
+		Check(wide.size() == 2 && !wide[0].solo && wide[0].members == std::vector<std::uint32_t>{ 0, 1 } && wide[1].solo && wide[1].members[0] == 2,
+			"stragglers within twice the chunk size form a chunk, one beyond stays solo");
+
 		// A member with an out-of-range index is left out.
 		std::uint16_t bad[3]{ 0, 1, 7 };
 		members[1].indices = bad;
 		auto again = Bake::Cluster(members, 1024.0F, 2);
-		Check(again.size() == 1 && Bake::Build(layout, layout, members, again[0], 2) && again[0].baked.size() == 2, "bad indices drop only that member");
+		Check(again.size() == 2 && Bake::Build(layout, layout, members, again[0], 2) && again[0].baked.size() == 2, "bad indices drop only that member");
 	}
 
 	void TestFullPrecision()

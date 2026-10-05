@@ -40,13 +40,20 @@ namespace RC::Bake
 		float                      boundCenter[3]{};  // relative to origin
 		float                      boundRadius{ 0.0F };
 		std::vector<std::uint32_t> baked;  // members actually written (one whose data failed the checks is left out)
+		// One member drawn as it is (a clone of its mesh sharing its data): no vertex data written. It still
+		// replaces its original, so the reference can be hidden whole.
+		bool solo{ false };
 	};
 
-	// Grid cells of a_cellSize (by bound centre), each split so no chunk passes kMaxVertices; chunks with fewer
-	// than a_minMembers members are dropped (their meshes stay as they are).
-	[[nodiscard]] std::vector<Chunk> Cluster(std::span<const Member> a_members, float a_cellSize, std::uint32_t a_minMembers);
+	// Compact clusters: each chunk holds the members whose bound centres lie within a_chunkSize / 2 of its seed's,
+	// at most kMaxVertices vertices. The members of clusters smaller than a_minMembers get a second pass within
+	// 2 x a_chunkSize; one still alone gives a solo chunk (origin: its bound centre). Solos come after the others.
+	[[nodiscard]] std::vector<Chunk> Cluster(std::span<const Member> a_members, float a_chunkSize, std::uint32_t a_minMembers);
+
+	// One solo chunk per member, whatever its data: members that can't merge, drawn by clones of their meshes.
+	[[nodiscard]] std::vector<Chunk> Solos(std::span<const Member> a_members);
 
 	// Writes the chunk's data: the members' vertices (a_from) in the chunk's format (a_to, Vertex::Convertible).
-	// False when fewer than a_minMembers members could be written.
+	// False when fewer than a_minMembers members could be written. A solo chunk only gets baked = members.
 	[[nodiscard]] bool Build(const Vertex::Layout& a_from, const Vertex::Layout& a_to, std::span<const Member> a_members, Chunk& a_chunk, std::uint32_t a_minMembers);
 }

@@ -32,6 +32,11 @@ namespace RC::Engine
 		constexpr std::uint64_t kRegisterDynamicID = 272586;   // MultiCellVisibilityData::RegisterDynamicObject   0x1427AF460
 		constexpr std::uint64_t kUnregisterDynamicID = 697930; // MultiCellVisibilityData::UnregisterDynamicObject 0x1427AF590
 		constexpr std::uint64_t kGridGetID = 1330136;          // GridCellArray::Get(x, y)
+		constexpr std::uint32_t kCombinedRefsExtra = 0xC5;     // ExtraCombinedRefs (vtable 130663)
+		// A save load clears every cell, then purges the cell buffer (FO4-ENGINE-NOTES 7.12).
+		constexpr std::uint64_t kGameResetID = 124452;         // Main::PerformGameReset                   0x140D3B800
+		constexpr std::size_t   kGameResetPurgeSite = 0x2ED;   //   call 1075115 (E8 rel32), after TES::ClearAllCells
+		constexpr std::uint64_t kPurgeCellsID = 1075115;       // TES::PurgeBufferedCells                  0x1400F70A0
 		constexpr std::size_t   kCanMergeSlot = 0x31;          // BSShaderProperty::CanMerge(BSShaderProperty*)
 
 		// TES and the exterior cell grid (layouts from CBRO's Compat.h).
@@ -80,9 +85,11 @@ namespace RC::Engine
 			std::uintptr_t unregisterDynamic{ 0 };
 			bool           previsFeed{ false };  // every previs address resolved
 			std::uintptr_t triShapeVtable{ 0 };
+			std::uintptr_t meshLODTriShapeVtable{ 0 };
 			std::uintptr_t nodeVtable{ 0 };
 			std::uintptr_t fadeNodeVtable{ 0 };
 			std::uintptr_t lightingShaderVtable{ 0 };
+			std::uintptr_t effectShaderVtable{ 0 };
 		};
 		Addresses g;
 
@@ -145,15 +152,22 @@ namespace RC::Engine
 		g.unregisterDynamic = Resolve(kUnregisterDynamicID, "UnregisterDynamicObject", feed);
 		g.previsFeed = feed;
 		g.triShapeVtable = VtableOf(RE::VTABLE::BSTriShape, "BSTriShape", ok);
+		g.meshLODTriShapeVtable = VtableOf(RE::VTABLE::BSMeshLODTriShape, "BSMeshLODTriShape", ok);
 		g.nodeVtable = VtableOf(RE::VTABLE::NiNode, "NiNode", ok);
 		g.fadeNodeVtable = VtableOf(RE::VTABLE::BSFadeNode, "BSFadeNode", ok);
 		g.lightingShaderVtable = VtableOf(RE::VTABLE::BSLightingShaderProperty, "BSLightingShaderProperty", ok);
+		g.effectShaderVtable = VtableOf(RE::VTABLE::BSEffectShaderProperty, "BSEffectShaderProperty", ok);
 		return ok;
 	}
 
 	bool IsExactTriShape(const RE::NiAVObject* a_object) noexcept
 	{
 		return VtableOfObject(a_object) == g.triShapeVtable;
+	}
+
+	bool IsExactMeshLODTriShape(const RE::NiAVObject* a_object) noexcept
+	{
+		return VtableOfObject(a_object) == g.meshLODTriShapeVtable;
 	}
 
 	bool IsExactNode(const RE::NiAVObject* a_object) noexcept
@@ -172,6 +186,11 @@ namespace RC::Engine
 		return VtableOfObject(a_property) == g.lightingShaderVtable;
 	}
 
+	bool IsEffectShader(const void* a_property) noexcept
+	{
+		return VtableOfObject(a_property) == g.effectShaderVtable;
+	}
+
 	bool CanMerge(void* a_property, void* a_other)
 	{
 		using func_t = bool (*)(void*, void*);
@@ -179,10 +198,19 @@ namespace RC::Engine
 		return vtable[kCanMergeSlot](a_property, a_other);
 	}
 
-	RE::NiAVObject* Clone(RE::NiAVObject* a_object)
+	RE::NiAVObject* Clone(RE::NiAVObject* a_object, bool a_plain)
 	{
 		using func_t = RE::NiObject* (*)(RE::NiObject*);
-		return static_cast<RE::NiAVObject*>(reinterpret_cast<func_t>(g.clone)(a_object));
+		const auto clone = static_cast<RE::NiAVObject*>(reinterpret_cast<func_t>(g.clone)(a_object));
+		// BSMeshLODTriShape is BSTriShape plus three u32 after it; its own virtuals only stream, clone and pick the
+		// drawn LOD prefix, and both free through the same allocator. Becoming the base class: vtable and type byte
+		// as BSTriShape's CreateClone sets them, mesh-LOD flag cleared (FO4-ENGINE-NOTES 7.11).
+		if (a_plain && clone && IsExactMeshLODTriShape(clone)) {
+			*reinterpret_cast<std::uintptr_t*>(clone) = g.triShapeVtable;
+			*Field<std::uint8_t>(clone, Offset::kGeometryType) = 3;
+			clone->flags.flags &= ~ObjectFlag::kMeshLOD;
+		}
+		return clone;
 	}
 
 	void* CreateTriShape(const void* a_vertices, std::uint32_t a_vertexBytes, std::uint64_t a_desc, const std::uint16_t* a_indices, std::uint32_t a_indexCount)
@@ -330,6 +358,13 @@ namespace RC::Engine
 		}
 
 		node->flags.flags |= ObjectFlag::kPickChildren | (a_shape->flags.flags & ObjectFlag::kMeshLOD);
+		if (a_shape->flags.flags & ObjectFlag::kMeshLOD) {
+			// A BSMeshLODTriShape draws the LOD prefix of this node's level, nothing at level 0: start at full detail,
+			// settled, as DetermineMeshLODLevel leaves a node with mesh LOD off (FO4-ENGINE-NOTES 7.11).
+			node->meshLODFadingLevel = 2;
+			node->currentMeshLODLevel = 3;
+			node->previousMeshLODLevel = 3;
+		}
 		node->previousMaxA = 1.0F;
 		if (a_fade >= 1.0F) {
 			// Faded in, as TESObjectCELL::UpdateFadeNodes leaves a cell's fade nodes after a load.
@@ -426,6 +461,68 @@ namespace RC::Engine
 		return tes && tes->interiorCell;
 	}
 
+	namespace
+	{
+		// TESObjectCELL +0xD0 loadedData; its +0xC0 / +0xD0 array of attached precombined chunks (7.12).
+		bool ReadPrecombinedList(const RE::TESObjectCELL* a_cell, RE::NiAVObject* const*& a_list, std::uint32_t& a_count) noexcept
+		{
+			__try {
+				const auto loaded = *reinterpret_cast<const std::byte* const*>(reinterpret_cast<const std::byte*>(a_cell) + 0xD0);
+				a_list = loaded ? *reinterpret_cast<RE::NiAVObject* const* const*>(loaded + 0xC0) : nullptr;
+				a_count = loaded && a_list ? *reinterpret_cast<const std::uint32_t*>(loaded + 0xD0) : 0;
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		bool ReadRadius(RE::NiAVObject* const* a_list, std::uint32_t a_index, float& a_radius) noexcept
+		{
+			__try {
+				const auto object = a_list[a_index];
+				a_radius = object ? object->worldBound.fRadius : 0.0F;
+				return object != nullptr;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+	}
+
+	std::uint32_t PrecombinedChunks(const RE::TESObjectCELL* a_cell, std::vector<float>* a_radii)
+	{
+		RE::NiAVObject* const* list = nullptr;
+		std::uint32_t          count = 0;
+		if (!ReadPrecombinedList(a_cell, list, count)) {
+			return 0;
+		}
+		for (std::uint32_t i = 0; a_radii && i < count; ++i) {
+			if (float radius = 0.0F; ReadRadius(list, i, radius)) {
+				a_radii->push_back(radius);
+			}
+		}
+		return count;
+	}
+
+	const void* CombinedRefs(const RE::TESObjectCELL* a_cell) noexcept
+	{
+		const auto extras = a_cell ? a_cell->extraList.get() : nullptr;
+		return extras ? extras->GetByType(static_cast<RE::EXTRA_DATA_TYPE>(kCombinedRefsExtra)) : nullptr;
+	}
+
+	bool InCombinedRefs(const void* a_combinedRefs, std::uint32_t a_formID) noexcept
+	{
+		if (!a_combinedRefs) {
+			return false;
+		}
+		__try {
+			// ExtraCombinedRefs +0x18: BSTSet<u32 formID>, CommonLibF4's BSTScatterTable layout (capacity +0x24,
+			// sentinel +0x30, entries +0x40: what TESObjectCELL::AddReference reads, FO4-ENGINE-NOTES 7.12).
+			return reinterpret_cast<const RE::BSTSet<std::uint32_t>*>(static_cast<const std::byte*>(a_combinedRefs) + 0x18)->contains(a_formID);
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
 	bool PrecombinesEnabled() noexcept
 	{
 		return *reinterpret_cast<const volatile std::uint8_t*>(g.useCombined) != 0;
@@ -516,14 +613,87 @@ namespace RC::Engine
 
 	namespace
 	{
+		// MultiCellVisibilityData's dynamic-object set: a BSTSet<NiAVObject*> whose table starts at +0x88 (capacity
+		// +0x94, free +0x98, entries +0xB0; FO4-ENGINE-NOTES 5.5d), the layout of CommonLibF4's BSTScatterTable.
+		constexpr std::size_t kDynamicSet = 0x88;
+		using DynamicSet = RE::BSTSet<RE::NiAVObject*>;
+
+		[[nodiscard]] bool InDynamicSet(const void* a_visibility, RE::NiAVObject* a_object) noexcept
+		{
+			__try {
+				return reinterpret_cast<const DynamicSet*>(static_cast<const std::byte*>(a_visibility) + kDynamicSet)->contains(a_object);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+	}
+
+	bool UnregisterIfDynamic(RE::NiAVObject* a_object) noexcept
+	{
+		const auto visibility = Visibility();
+		if (!visibility || !a_object || !InDynamicSet(visibility, a_object)) {
+			return false;
+		}
+		reinterpret_cast<DynamicFunc>(g.unregisterDynamic)(visibility, a_object);
+		return true;
+	}
+
+	std::uint32_t PrevisDynamicObjects() noexcept
+	{
+		const auto visibility = static_cast<const std::byte*>(Visibility());
+		if (!visibility) {
+			return 0;
+		}
+		__try {
+			const auto capacity = *reinterpret_cast<const std::uint32_t*>(visibility + kDynamicSet + 0x0C);
+			const auto free = *reinterpret_cast<const std::uint32_t*>(visibility + kDynamicSet + 0x10);
+			return capacity >= free ? capacity - free : 0;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return 0;
+		}
+	}
+
+	namespace
+	{
 		using QueryFunc = void (*)();
 		QueryFunc g_queryOriginal{ nullptr };
 		void (*g_queryAfter)() { nullptr };
 
+		std::chrono::steady_clock::duration g_queryTime{};  // main thread only
+		std::uint32_t                       g_queryCalls{ 0 };
+
 		void PrevisQueryThunk()
 		{
+			const auto start = std::chrono::steady_clock::now();
 			g_queryOriginal();
+			g_queryTime += std::chrono::steady_clock::now() - start;
+			++g_queryCalls;
 			g_queryAfter();
+		}
+
+		using PurgeFunc = void (*)(void*);
+		PurgeFunc g_purgeOriginal{ nullptr };
+		void (*g_resetAfter)() { nullptr };
+
+		void GameResetPurgeThunk(void* a_tes)
+		{
+			g_purgeOriginal(a_tes);
+			g_resetAfter();
+		}
+
+		// One trampoline for every call-site hook (allocating again would replace it).
+		F4SE::Trampoline& Trampoline()
+		{
+			static const bool allocated = (F4SE::AllocTrampoline(128), true);
+			(void)allocated;
+			return F4SE::GetTrampoline();
+		}
+
+		// The engine's `call a_target` at a_site (E8 rel32), or 0 when another plugin took it.
+		[[nodiscard]] std::uintptr_t CallTarget(std::uintptr_t a_site) noexcept
+		{
+			const auto site = reinterpret_cast<const std::uint8_t*>(a_site);
+			return site[0] == 0xE8 ? a_site + 5 + *reinterpret_cast<const std::int32_t*>(site + 1) : 0;
 		}
 	}
 
@@ -533,17 +703,40 @@ namespace RC::Engine
 			return false;
 		}
 		// The site must still be the engine's own `call 1264353` (another plugin may have taken it).
-		const auto site = reinterpret_cast<const std::uint8_t*>(g.previsQuerySite);
-		const auto target = site[0] == 0xE8 ? g.previsQuerySite + 5 + *reinterpret_cast<const std::int32_t*>(site + 1) : 0;
+		const auto target = CallTarget(g.previsQuerySite);
 		if (target != g.previsQuery) {
 			logger::error("previs: Render_PreUI+0x{:X} is not the engine's call to the previs query (byte {:02X}, target {:X}); "
 						  "the original meshes are shown while previs is active",
-				kPrevisQuerySite, site[0], target);
+				kPrevisQuerySite, *reinterpret_cast<const std::uint8_t*>(g.previsQuerySite), target);
 			return false;
 		}
-		F4SE::AllocTrampoline(64);
 		g_queryAfter = a_after;
-		g_queryOriginal = reinterpret_cast<QueryFunc>(F4SE::GetTrampoline().write_call<5>(g.previsQuerySite, &PrevisQueryThunk));
+		g_queryOriginal = reinterpret_cast<QueryFunc>(Trampoline().write_call<5>(g.previsQuerySite, &PrevisQueryThunk));
+		return true;
+	}
+
+	double TakePrevisQueryTime(std::uint32_t& a_calls) noexcept
+	{
+		a_calls = std::exchange(g_queryCalls, 0);
+		return std::chrono::duration<double, std::milli>(std::exchange(g_queryTime, {})).count();
+	}
+
+	bool InstallGameResetHook(void (*a_after)())
+	{
+		bool       ok = true;
+		const auto reset = Resolve(kGameResetID, "Main::PerformGameReset", ok);
+		const auto purge = Resolve(kPurgeCellsID, "TES::PurgeBufferedCells", ok);
+		if (!ok || !a_after) {
+			return false;
+		}
+		const auto site = reset + kGameResetPurgeSite;
+		if (CallTarget(site) != purge) {
+			logger::error("Main::PerformGameReset+0x{:X} is not the engine's call to TES::PurgeBufferedCells (byte {:02X})",
+				kGameResetPurgeSite, *reinterpret_cast<const std::uint8_t*>(site));
+			return false;
+		}
+		g_resetAfter = a_after;
+		g_purgeOriginal = reinterpret_cast<PurgeFunc>(Trampoline().write_call<5>(site, &GameResetPurgeThunk));
 		return true;
 	}
 }
