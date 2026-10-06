@@ -45,10 +45,27 @@ namespace RC::Bake
 		bool solo{ false };
 	};
 
+	// How the chunk size grows with distance from the player: x1 within `growth`, then in proportion to the distance
+	// (about the same size on screen), at most kMaxGrowth. growth 0 = x1 everywhere.
+	inline constexpr float kMaxGrowth = 8.0F;
+	struct Sizing
+	{
+		float eye[3]{};
+		float growth{ 0.0F };
+
+		[[nodiscard]] float At(const float a_point[3]) const noexcept;
+	};
+
 	// Compact clusters: each chunk holds the members whose bound centres lie within a_chunkSize / 2 of its seed's,
 	// at most kMaxVertices vertices. The members of clusters smaller than a_minMembers get a second pass within
-	// 2 x a_chunkSize; one still alone gives a solo chunk (origin: its bound centre). Solos come after the others.
-	[[nodiscard]] std::vector<Chunk> Cluster(std::span<const Member> a_members, float a_chunkSize, std::uint32_t a_minMembers);
+	// 2 x a_chunkSize; one still alone joins the chunk whose members' centre is nearest, within 2 x a_chunkSize
+	// (a_joined counts them), else gives a solo chunk (origin: its bound centre). Solos come after the others.
+	// a_spread > 0 also keeps every cluster dense: its reach (a member's distance from the seed, or from the chunk's
+	// centre when joining, plus its radius) stays within a_chunkSize / 4 or within a_spread x the radius of one sphere
+	// holding the volume of all its members' bounds; a member that would spread it further is left for another.
+	// a_sizing scales every distance above by its factor at the seed (or at the chunk's centre when joining).
+	[[nodiscard]] std::vector<Chunk> Cluster(std::span<const Member> a_members, float a_chunkSize, std::uint32_t a_minMembers, float a_spread = 0.0F,
+		std::uint32_t* a_joined = nullptr, const Sizing& a_sizing = {});
 
 	// One solo chunk per member, whatever its data: members that can't merge, drawn by clones of their meshes.
 	[[nodiscard]] std::vector<Chunk> Solos(std::span<const Member> a_members);

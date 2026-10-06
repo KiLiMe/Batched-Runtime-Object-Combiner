@@ -73,6 +73,8 @@ namespace RC::Combine::Manager
 			RE::NiNode*               parent{ nullptr };
 		};
 
+		constexpr std::uint8_t kNotAlone = 0xFF;  // ChunkRecord::alone of a combined chunk or a not-mergeable solo
+
 		// One applied chunk (the container holds it): for previs and the summary's audit.
 		struct ChunkRecord
 		{
@@ -82,6 +84,7 @@ namespace RC::Combine::Manager
 			std::uint32_t                 members{ 0 };
 			std::uint32_t                 triangles{ 0 };
 			std::uint32_t                 group{ 0 };  // index into Applied::groups: the node it hangs under
+			std::uint8_t                  alone{ kNotAlone };  // a mergeable solo: why it stayed alone (Alone)
 
 			// What a view's culling group gets, and what previs tests: the fade node, or the mesh itself.
 			[[nodiscard]] RE::NiAVObject* Fed() const noexcept { return fadeNode ? static_cast<RE::NiAVObject*>(fadeNode) : shape.get(); }
@@ -98,12 +101,25 @@ namespace RC::Combine::Manager
 			bool                      registered{ false };  // a previs dynamic object (Engine::RegisterPrevisObject)
 		};
 
+		// Roots hidden whole wait under one hidden node per parent, hung on the cell node beside that parent: the scene
+		// walk reads only the cell node's children 2, 3 and 9 (FO4-ENGINE-NOTES 5.3), so the walk and CBRO's cell-node
+		// scans no longer step over each one every frame (~33k in 25 cells, run 28). The engine takes a root off its
+		// node through the root's own parent or drops the whole cell node, and AttachChild takes a child off its old
+		// parent first (7.13), so a parked root goes wherever the engine puts it.
+		struct Parking
+		{
+			RE::NiPointer<RE::NiNode>                  node;
+			RE::NiPointer<RE::NiNode>                  home;  // the roots' parent, where they go back
+			std::vector<RE::NiPointer<RE::NiAVObject>> roots;
+		};
+
 		struct Applied
 		{
 			std::vector<Container>   containers;
 			std::vector<ChunkGroup>  groups;
 			std::vector<ChunkRecord> chunks;
 			std::vector<Hidden>      hidden;
+			std::vector<Parking>     parking;
 			std::uint64_t            frame{ 0 };         // applied at this tick
 			bool                     fallback{ false };  // originals shown again and chunks hidden: revert pending
 		};
@@ -126,6 +142,8 @@ namespace RC::Combine::Manager
 			bool                     dirty{ true };
 			bool                     building{ false };
 			bool                     blind{ false };  // the main view doesn't draw the probes' groups: originals only
+			bool                     sized{ false };  // sizing holds the player's position at the last gather
+			Bake::Sizing             sizing;
 			std::unique_ptr<Applied> applied;
 			std::vector<Probe>       probes;
 			std::vector<std::pair<const char*, std::uint32_t>> blocked;  // the last gather's blocked parts by class
@@ -144,6 +162,7 @@ namespace RC::Combine::Manager
 		std::unordered_map<RE::TESObjectCELL*, CellState>     g_cells;
 		std::unordered_map<std::uint32_t, RE::TESObjectCELL*> g_hiddenRefs;  // formID -> cell
 		Gather::HiddenSet                                     g_ours;
+		Gather::ParkedMap                                     g_parked;  // Parking::node -> Parking::home
 		Gather::FormSet                                       g_meshByMesh;  // references whose root stays visible
 		std::vector<std::unique_ptr<Job>>                     g_jobs;  // submitted: baking, or waiting for GPU buffers
 		Totals                                                g_totals;
@@ -167,6 +186,11 @@ namespace RC::Combine::Manager
 		std::uintptr_t g_originalUpdate{ 0 };
 		Clock::time_point g_lastSummary{};
 		constexpr auto    kSummaryInterval = std::chrono::seconds(10);
+		// The size line and the census walk every attached cell: a ~6 ms tick each summary (run 38). They are logged
+		// again only once the scene changed or the camera moved kCensusMove units.
+		constexpr float   kCensusMove = 1000.0F;
+		std::uint64_t     g_censusVersion{ ~0ull };
+		RE::NiPoint3      g_censusEye{};
 
 		// Frame times between ticks (gaps over a second, loading screens, left out) and the tick's own cost, per
 		// summary interval: the log's FPS for each state of the A/B.
@@ -214,7 +238,9 @@ namespace RC::Combine::Manager
 				const auto  start = Clock::now();
 				const auto& settings = Settings::Get();
 				for (auto& bucket : job->buckets) {
-					bucket.chunks = bucket.cloneOnly ? Bake::Solos(bucket.members) : Bake::Cluster(bucket.members, settings.chunkSize, settings.minShapesPerChunk);
+					bucket.chunks = bucket.cloneOnly ? Bake::Solos(bucket.members) :
+					                                   Bake::Cluster(bucket.members, job->chunkSize, settings.minShapesPerChunk, settings.clusterSpread,
+														   &job->stats.joined, job->sizing);
 					for (auto& chunk : bucket.chunks) {
 						if (!Bake::Build(bucket.layout, bucket.chunkLayout, bucket.members, chunk, settings.minShapesPerChunk)) {
 							chunk.vertexCount = 0;
@@ -268,6 +294,80 @@ namespace RC::Combine::Manager
 			a_state.lastChange = g_frame;
 		}
 
+		// ---- distance sizing ------------------------------------------------------------------------------------
+		// Meshes are merged coarser the farther they lie from the player (fChunkGrowth, Bake::Sizing): what the sun's far
+		// cascade draws follows how many of RC's objects stand far away (run 35), and up close compact chunks keep the
+		// main view's occlusion fine. Per grid cell (run 36) it drew less than the precombines; per distance the sizes
+		// change smoothly inside a cell too. A cell is rebuilt once the player has moved enough to change the size at
+		// its nearest or farthest point by kResizeRatio (checked every kResizeCheckFrames).
+		constexpr std::uint64_t kResizeCheckFrames = 30;
+		constexpr float         kResizeRatio = 2.0F;
+		constexpr float         kCellUnits = 4096.0F;
+
+		[[nodiscard]] Bake::Sizing CurrentSizing()
+		{
+			Bake::Sizing sizing;
+			const auto   player = RE::PlayerCharacter::GetSingleton();
+			if (!player || Engine::InInterior()) {
+				return sizing;
+			}
+			const auto& at = player->data.location;
+			sizing.eye[0] = at.x;
+			sizing.eye[1] = at.y;
+			sizing.eye[2] = at.z;
+			sizing.growth = Settings::Get().chunkGrowth;
+			return sizing;
+		}
+
+		// The size factors at an exterior cell's nearest and farthest point (its square, in x and y), or {1, 1}.
+		[[nodiscard]] std::pair<float, float> FactorRange(RE::TESObjectCELL* a_cell, const Bake::Sizing& a_sizing)
+		{
+			if (a_sizing.growth <= 0.0F || !a_cell || a_cell->IsInterior()) {
+				return { 1.0F, 1.0F };
+			}
+			const float x0 = static_cast<float>(a_cell->GetDataX()) * kCellUnits;
+			const float y0 = static_cast<float>(a_cell->GetDataY()) * kCellUnits;
+			const float nx = std::clamp(a_sizing.eye[0], x0, x0 + kCellUnits) - a_sizing.eye[0];
+			const float ny = std::clamp(a_sizing.eye[1], y0, y0 + kCellUnits) - a_sizing.eye[1];
+			const float fx = std::max(std::abs(a_sizing.eye[0] - x0), std::abs(a_sizing.eye[0] - x0 - kCellUnits));
+			const float fy = std::max(std::abs(a_sizing.eye[1] - y0), std::abs(a_sizing.eye[1] - y0 - kCellUnits));
+			const auto  factor = [&](float a_distance) { return std::clamp(a_distance / a_sizing.growth, 1.0F, Bake::kMaxGrowth); };
+			return { factor(std::sqrt(nx * nx + ny * ny)), factor(std::sqrt(fx * fx + fy * fy)) };
+		}
+
+		void CheckSizing()
+		{
+			if (g_frame % kResizeCheckFrames != 0) {
+				return;
+			}
+			// One rebuild at a time, the cell whose sizes are furthest off first, and none while any cell builds (a load):
+			// at 1.5x, rebuilds of several cells at once followed every few steps (run 37: 184 applies in ~6 minutes).
+			for (const auto& [cell, state] : g_cells) {
+				if ((state.dirty && !state.blind) || state.building) {
+					return;
+				}
+			}
+			const auto now = CurrentSizing();
+			const auto ratio = [](float a_a, float a_b) { return std::max(a_a, a_b) / std::min(a_a, a_b); };
+			CellState* worst = nullptr;
+			float      worstRatio = kResizeRatio;
+			for (auto& [cell, state] : g_cells) {
+				if (!state.sized || state.dirty) {
+					continue;
+				}
+				const auto [nearNow, farNow] = FactorRange(cell, now);
+				const auto [nearThen, farThen] = FactorRange(cell, state.sizing);
+				if (const float off = std::max(ratio(nearNow, nearThen), ratio(farNow, farThen)); off >= worstRatio) {
+					worst = &state;
+					worstRatio = off;
+				}
+			}
+			if (worst) {
+				MarkChanged(*worst);
+				logger::info("player moved: cell {:08X}'s chunk sizes are {:.1f}x off, rebuilt", worst->formID, worstRatio);
+			}
+		}
+
 		// A hidden root goes back into previs's dynamic objects only while it is still its reference's 3D in an
 		// attached cell: the engine unregisters a reference's 3D when it unloads or its cell detaches, and the set keeps
 		// raw pointers (FO4-ENGINE-NOTES 5.5d).
@@ -285,14 +385,85 @@ namespace RC::Combine::Manager
 			}
 		}
 
+		// Moves a_cell's roots hidden whole (still in their parent, exact NiNode children of the cell node) under a
+		// hidden node beside their parent. Detached by index: DetachChild scans the children with a reference count
+		// taken and dropped on each, and AttachChild's own detach would do that scan per root (7.13).
+		void Park(Applied& a_applied, RE::TESObjectCELL* a_cell, const std::vector<RE::NiAVObject*>& a_roots)
+		{
+			// (appended after child 9, the last child the walk reads, so no role slot of the cell node is taken)
+			const auto loaded = a_cell->loadedData;
+			const auto cell3D = loaded ? loaded->cell3D.get() : nullptr;
+			if (!cell3D || cell3D->children.capacity() <= 9 || !cell3D->children[9]) {
+				return;
+			}
+			std::unordered_map<RE::NiNode*, std::unordered_set<const RE::NiAVObject*>> byHome;
+			for (const auto root : a_roots) {
+				if (const auto home = root->parent; home && home->parent == cell3D && Engine::IsPlainNode(home)) {
+					byHome[home].insert(root);
+				}
+			}
+			for (const auto& [home, roots] : byHome) {
+				const auto node = Engine::NewNode(static_cast<std::uint16_t>(std::min<std::size_t>(roots.size(), 0xFFFF)));
+				if (!node) {
+					continue;
+				}
+				node->name = RE::BSFixedString("RuntimeCombiner hidden");
+				node->local = home->local;
+				node->world = home->world;
+				node->previousWorld = home->world;
+				node->SetAppCulled(true);
+				cell3D->AttachChild(node, false);
+				auto& parking = a_applied.parking.emplace_back();
+				parking.node.reset(node);
+				parking.home.reset(home);
+				g_parked[node] = home;
+				for (auto i = home->children.capacity(); i-- > 0;) {
+					if (const auto child = home->children[i].get(); child && roots.contains(child)) {
+						RE::NiPointer<RE::NiAVObject> held;
+						home->DetachChildAt(i, held);
+						node->AttachChild(held.get(), false);
+						parking.roots.push_back(std::move(held));
+					}
+				}
+			}
+		}
+
+		// Puts the parked roots back in their parent while it still hangs on the same cell node; a root the engine
+		// moved or dropped meanwhile is no longer under the parking node and is left alone.
+		void Unpark(Applied& a_applied)
+		{
+			for (auto& parking : a_applied.parking) {
+				const auto node = parking.node.get();
+				const auto home = parking.home.get();
+				const bool homeThere = node && home && home->parent && home->parent == node->parent;
+				for (auto i = node ? node->children.capacity() : std::uint16_t{ 0 }; i-- > 0;) {
+					if (!node->children[i]) {
+						continue;
+					}
+					RE::NiPointer<RE::NiAVObject> held;
+					node->DetachChildAt(i, held);
+					if (homeThere && held) {
+						home->AttachChild(held.get(), true);
+					}
+				}
+				if (node && node->parent) {
+					node->parent->DetachChild(node);
+				}
+				g_parked.erase(node);
+			}
+			a_applied.parking.clear();
+		}
+
 		// Shows the originals again and hides the chunks (main thread, the tick). Each group and chunk is hidden itself
 		// too: previs tests its dynamic objects and their children by their own flag, not their parents' (5.5d).
-		void Fallback(CellState& a_state)
+		// With a_carry, the roots out of previs's dynamic objects stay out and are handed over there (Apply's rebuild).
+		void Fallback(CellState& a_state, std::vector<Hidden>* a_carry = nullptr)
 		{
 			const auto applied = a_state.applied.get();
 			if (!applied || applied->fallback) {
 				return;
 			}
+			Unpark(*applied);
 			for (auto& container : applied->containers) {
 				if (container.node && !container.node->GetAppCulled()) {
 					container.node->SetAppCulled(true);
@@ -312,7 +483,12 @@ namespace RC::Combine::Manager
 				if (hidden.object && hidden.object->GetAppCulled()) {
 					hidden.object->SetAppCulled(false);
 				}
-				Reregister(hidden);
+				if (a_carry && hidden.unregistered) {
+					a_carry->push_back(hidden);
+					hidden.unregistered = false;
+				} else {
+					Reregister(hidden);
+				}
 			}
 			applied->fallback = true;
 		}
@@ -320,12 +496,12 @@ namespace RC::Combine::Manager
 		// Fallback, then takes the chunks out of previs and the scene and drops every reference held (main thread,
 		// outside engine callbacks that walk the parent's children). The engine's queued removal keeps each group, and
 		// the chunks it holds, alive until previs lets go of it (FO4-ENGINE-NOTES 5.5d).
-		void Revert(CellState& a_state)
+		void Revert(CellState& a_state, std::vector<Hidden>* a_carry = nullptr)
 		{
 			if (!a_state.applied) {
 				return;
 			}
-			Fallback(a_state);
+			Fallback(a_state, a_carry);
 			auto applied = std::move(a_state.applied);
 			for (auto& group : applied->groups) {
 				if (std::exchange(group.registered, false)) {
@@ -501,6 +677,68 @@ namespace RC::Combine::Manager
 			return text.empty() ? "none"s : text;
 		}
 
+		std::string AloneSummary(const std::array<std::uint32_t, static_cast<std::size_t>(Alone::kCount)>& a_counts)
+		{
+			std::string text;
+			for (std::size_t i = 0; i < a_counts.size(); ++i) {
+				if (a_counts[i]) {
+					text += std::format("{}{} {}", text.empty() ? "" : ", ", AloneName(static_cast<Alone>(i)), a_counts[i]);
+				}
+			}
+			return text.empty() ? "none"s : text;
+		}
+
+		// Why a_bucket's member a_index stayed alone: the nearest other member of its material under the same parent
+		// (a_byName: material name -> bucket, member), and the first merge key that tells their buckets apart.
+		Alone WhyAlone(const Job& a_job, std::uint32_t a_bucket, std::uint32_t a_index,
+			const std::unordered_map<std::uintptr_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>>& a_byName)
+		{
+			const auto& bucket = a_job.buckets[a_bucket];
+			if (bucket.copiesOnly) {
+				return Alone::kCopies;
+			}
+			const auto found = a_byName.find(*Engine::Field<std::uintptr_t>(bucket.property, 0x10));
+			if (found == a_byName.end()) {
+				return Alone::kUnique;
+			}
+			const auto&   self = bucket.members[a_index];
+			float         best = std::numeric_limits<float>::max();
+			const Bucket* nearest = nullptr;
+			for (const auto& [b, m] : found->second) {
+				const auto& other = a_job.buckets[b];
+				if ((b == a_bucket && m == a_index) || other.parent != bucket.parent) {
+					continue;
+				}
+				const auto& o = other.members[m];
+				const float d[3]{ o.center[0] - self.center[0], o.center[1] - self.center[1], o.center[2] - self.center[2] };
+				const float distance = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+				if (distance < best) {
+					best = distance;
+					nearest = &other;
+				}
+			}
+			const float reach = a_job.chunkSize * 2.0F * a_job.sizing.At(self.center);
+			if (!nearest) {
+				return Alone::kUnique;
+			}
+			if (best > reach * reach) {
+				return Alone::kFar;
+			}
+			if (nearest == &bucket) {
+				return Alone::kSameGroup;
+			}
+			if (nearest->fadeKey != bucket.fadeKey) {
+				return Alone::kFade;
+			}
+			if (nearest->desc != bucket.desc) {
+				return Alone::kFormat;
+			}
+			if (nearest->alphaKey != bucket.alphaKey) {
+				return Alone::kAlpha;
+			}
+			return nearest->objectKey != bucket.objectKey ? Alone::kShadowBits : Alone::kProperty;
+		}
+
 		void LogCell(const Job& a_job, std::string_view a_what)
 		{
 			if (!Settings::Get().logCells) {
@@ -508,12 +746,14 @@ namespace RC::Combine::Manager
 			}
 			const auto& s = a_job.stats;
 			logger::info(
-				"cell {} {}: {} references, {} with meshes captured ({} meshes), {} of them listed as precombined; {} chunks replace {} meshes ({} tris, {} verts, {:.1f} MB), "
-				"{} meshes alone cloned as they are (not mergeable: {}); {} references hidden whole, {} partly; gather {:.2f} ms, bake {:.2f} ms "
-				"(worker), apply {:.2f} ms; left out: {}",
-				CellName(a_job.cell, a_job.cellFormID), a_what, s.references, s.candidates, s.capturedShapes, s.precombinedRefs, s.chunks, s.bakedShapes,
-				s.triangles, s.vertices, static_cast<double>(s.vertexBytes) / (1 << 20), s.solos, SkipSummary(s.cloned), s.wholeRefs, s.partialRefs,
-				s.gatherMs, s.bakeMs, s.applyMs, SkipSummary(s.skips));
+				"cell {} {} (chunk size {:.0f}-{:.0f}): {} references, {} with meshes captured ({} meshes), {} of them listed as precombined; {} chunks replace {} meshes ({} tris, {} verts, {:.1f} MB), "
+				"{} of them copies of one mesh ({} meshes; copy-only meshes: {}), {} stragglers joined a nearby chunk, {} meshes alone cloned as they "
+				"are (not mergeable: {}; mergeable, alone: {}); {} references hidden whole, {} partly; gather {:.2f} ms, bake {:.2f} ms (worker), apply "
+				"{:.2f} ms; left out: {}",
+				CellName(a_job.cell, a_job.cellFormID), a_what, a_job.chunkSize * FactorRange(a_job.cell, a_job.sizing).first,
+				a_job.chunkSize * FactorRange(a_job.cell, a_job.sizing).second, s.references, s.candidates, s.capturedShapes, s.precombinedRefs, s.chunks, s.bakedShapes,
+				s.triangles, s.vertices, static_cast<double>(s.vertexBytes) / (1 << 20), s.copyChunks, s.copyShapes, SkipSummary(s.copies), s.joined,
+				s.solos, SkipSummary(s.cloned), AloneSummary(s.alone), s.wholeRefs, s.partialRefs, s.gatherMs, s.bakeMs, s.applyMs, SkipSummary(s.skips));
 		}
 
 		// ---- previs --------------------------------------------------------------------------------------------
@@ -570,7 +810,7 @@ namespace RC::Combine::Manager
 					return false;
 				}
 				const auto loaded = ref->loadedData;
-				if (!loaded || loaded->data3D.get() != root || root->parent != source.parent || CulledByGame(root) ||
+				if (!loaded || loaded->data3D.get() != root || Gather::HomeOf(root->parent, g_parked) != source.parent || CulledByGame(root) ||
 					!(World(root->world) == World(source.rootWorld))) {
 					return false;
 				}
@@ -659,16 +899,38 @@ namespace RC::Combine::Manager
 				}
 			}
 
-			Revert(a_state);  // the previous version, if any, in the same frame: no gap
+			// The previous version, if any, in the same frame: no gap. Its roots out of previs's dynamic objects stay out
+			// for the new version to take over: registering and unregistering in one frame only queues both, so the check
+			// below would find them not in the set and every rebuild left its roots in (run 37: 3,457 -> 25,288 objects,
+			// the query 6.7 ms a frame while it rained).
+			std::vector<Hidden> carried;
+			Revert(a_state, &carried);
 
 			auto applied = std::make_unique<Applied>();
 			applied->frame = g_frame;
 			std::map<std::tuple<RE::NiNode*, std::int32_t, std::int32_t>, std::uint32_t> groups;  // (parent, square) -> group
-			const float groupSize = std::max(Settings::Get().chunkSize, 256.0F);
+			// Group squares (fGroupSize, apart from fChunkSize). Previs's query tests each group and skips an off-screen
+			// square in one test (5.5d, run 14). CBRO skips the query in its frames but scans each group node it is
+			// offered every frame: with one group per parent, as the precombines' one combined-object node per cell, its
+			// cell-node scans fell 0.55 -> 0.26 ms and the cull 3.53 -> 2.82 ms, below the precombines' 3.0 (run 31).
+			// Auto (below 0): one group per parent with CBRO, 1024-unit squares without.
+			const float setting = Settings::Get().groupSize;
+			const float groupSize = setting >= 0.0F ? setting : g_cbroLoaded ? 0.0F : 1024.0F;
+			const auto  square = [&](float a_at) { return groupSize > 0.0F ? static_cast<std::int32_t>(std::floor(a_at / groupSize)) : 0; };
 			auto& stats = a_job.stats;
 
+			// Mergeable members by material name, to tell why a solo stayed alone (WhyAlone).
+			std::unordered_map<std::uintptr_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>> byName;
+			for (std::uint32_t b = 0; b < a_job.buckets.size(); ++b) {
+				const auto& bucket = a_job.buckets[b];
+				for (std::uint32_t m = 0; !bucket.cloneOnly && m < bucket.members.size(); ++m) {
+					byName[*Engine::Field<std::uintptr_t>(bucket.property, 0x10)].emplace_back(b, m);
+				}
+			}
+
 			std::size_t chunkIndex = 0;
-			for (auto& bucket : a_job.buckets) {
+			for (std::uint32_t bucketIndex = 0; bucketIndex < a_job.buckets.size(); ++bucketIndex) {
+				auto& bucket = a_job.buckets[bucketIndex];
 				for (auto& chunk : bucket.chunks) {
 					auto& triShape = a_job.triShapes[chunkIndex++];
 					// Parent world rotation is identity with unit scale (Gather checks), so local = world - parent.
@@ -737,8 +999,7 @@ namespace RC::Combine::Manager
 					// of an exact NiNode there to group 0 on its own (FO4-ENGINE-NOTES 5.5b), so the cull and CBRO's
 					// shadow tests still judge chunk by chunk. One node level deeper, the walk filed whole groups, and
 					// the sun's nearest cascade took twice the precombines' draws (runs 15-18).
-					const auto cell = std::make_tuple(bucket.parent, static_cast<std::int32_t>(std::floor(chunk.origin[0] / groupSize)),
-						static_cast<std::int32_t>(std::floor(chunk.origin[1] / groupSize)));
+					const auto cell = std::make_tuple(bucket.parent, square(chunk.origin[0]), square(chunk.origin[1]));
 					auto [slot, added] = groups.try_emplace(cell, static_cast<std::uint32_t>(applied->groups.size()));
 					if (added) {
 						const auto node = Engine::NewNode(16);
@@ -773,10 +1034,19 @@ namespace RC::Combine::Manager
 					}
 					if (chunk.solo) {
 						++stats.solos;
+						if (!bucket.cloneOnly) {
+							const auto why = WhyAlone(a_job, bucketIndex, chunk.baked.front(), byName);
+							++stats.alone[static_cast<std::size_t>(why)];
+							record.alone = static_cast<std::uint8_t>(why);
+						}
 						continue;
 					}
 					++stats.chunks;
 					stats.bakedShapes += static_cast<std::uint32_t>(chunk.baked.size());
+					if (bucket.copiesOnly) {
+						++stats.copyChunks;
+						stats.copyShapes += static_cast<std::uint32_t>(chunk.baked.size());
+					}
 					stats.triangles += chunk.triangleCount;
 					stats.vertices += chunk.vertexCount;
 					stats.vertexBytes += static_cast<std::uint64_t>(chunk.vertexCount) * bucket.chunkLayout.stride;
@@ -804,11 +1074,13 @@ namespace RC::Combine::Manager
 				g_ours.insert(a_object);
 				g_hiddenRefs[a_ref.formID] = a_job.cell;
 			};
-			std::vector<bool> wholeHidden(a_job.refs.size(), false);
+			std::vector<bool>            wholeHidden(a_job.refs.size(), false);
+			std::vector<RE::NiAVObject*> roots;
 			for (std::size_t i = 0; i < a_job.refs.size(); ++i) {
 				const auto& ref = a_job.refs[i];
 				if (ref.baked && ref.whole && ref.baked == ref.captured) {
 					hide(ref.root.get(), ref, true);
+					roots.push_back(ref.root.get());
 					wholeHidden[i] = true;
 					++stats.wholeRefs;
 				} else if (ref.baked) {
@@ -830,10 +1102,22 @@ namespace RC::Combine::Manager
 			}
 			// A root hidden whole is skipped by the query's test but still read in each of its three passes every frame:
 			// with ~25k of them the query took 8 ms a frame (run 13). It leaves the set while its chunks stand in.
+			std::unordered_set<const RE::NiAVObject*> carriedRoots;
+			for (const auto& hidden : carried) {
+				carriedRoots.insert(hidden.object.get());
+			}
 			for (auto& hidden : applied->hidden) {
 				if (hidden.object == hidden.root) {
-					hidden.unregistered = Engine::UnregisterIfDynamic(hidden.object.get());
+					hidden.unregistered = carriedRoots.erase(hidden.object.get()) > 0 || Engine::UnregisterIfDynamic(hidden.object.get());
 				}
+			}
+			for (auto& hidden : carried) {  // not hidden whole any more: back in, as Fallback would have
+				if (carriedRoots.contains(hidden.object.get())) {
+					Reregister(hidden);
+				}
+			}
+			if (!applied->containers.empty() && Settings::Get().parkHidden) {
+				Park(*applied, a_job.cell, roots);
 			}
 			stats.applyMs = Ms(start);
 			if (!applied->containers.empty()) {
@@ -927,7 +1211,11 @@ namespace RC::Combine::Manager
 				job->cellFormID = state.formID;
 				job->generation = ++state.generation;
 				job->started = Clock::now();
-				Gather::Cell(cell, g_ours, g_meshByMesh, *job);
+				job->chunkSize = settings.chunkSize;
+				job->sizing = CurrentSizing();
+				state.sizing = job->sizing;
+				state.sized = true;
+				Gather::Cell(cell, g_ours, g_parked, g_meshByMesh, *job);
 				state.blocked = job->stats.blockedClasses;
 				if (job->buckets.empty()) {
 					LogCell(*job, "nothing to combine"sv);
@@ -1290,6 +1578,107 @@ namespace RC::Combine::Manager
 				g_group0Drawn ? "yes" : "no");
 		}
 
+		// What the scene walk files into group 0 (Engine::WalkEntries), by kind and by nearest distance from the camera:
+		// entries and the meshes under them. Run 26: RC's scene took ~35% more sun-cascade registrations than the
+		// precombines' at an equal main view, and CBRO can't tell which objects; this tells the A/B's two states apart.
+		void LogCensus()
+		{
+			const auto camera = RE::Main::WorldRootCamera();
+			if (!camera) {
+				return;
+			}
+			struct Ours
+			{
+				std::string        kind;
+				const ChunkRecord* record{ nullptr };
+			};
+			std::unordered_map<const RE::NiAVObject*, Ours> ours;    // what RC hangs in the scene
+			std::unordered_set<const RE::NiAVObject*>       partly;  // ancestors of meshes RC hid one by one
+			for (const auto& [cell, state] : g_cells) {
+				for (const auto& probe : state.probes) {
+					ours.emplace(probe.node.get(), Ours{ "RC probe" });
+				}
+				if (!state.applied) {
+					continue;
+				}
+				for (const auto& record : state.applied->chunks) {
+					auto kind = record.members > 1             ? "RC chunk"s :
+					            record.alone == kNotAlone ? "RC solo (not mergeable)"s :
+					                                        std::format("RC solo ({})", AloneName(static_cast<Alone>(record.alone)));
+					ours.emplace(record.Fed(), Ours{ std::move(kind), &record });
+				}
+			}
+			std::vector<std::pair<float, const ChunkRecord*>> nearSolos;  // solos under 1500 units, for a sample
+			for (const auto object : g_ours) {
+				for (auto node = object ? object->parent : nullptr; node && partly.insert(node).second;) {
+					node = node->parent;
+				}
+			}
+
+			constexpr std::array<float, 3> kRings{ 1500.0F, 4000.0F, 14000.0F };
+			struct Row
+			{
+				std::array<std::uint32_t, 4> entries{};
+				std::array<std::uint32_t, 4> meshes{};
+				double                       nearRadius{ 0.0 };  // summed over the first two rings
+			};
+			std::map<std::string, Row>     rows;
+			std::vector<Engine::WalkEntry> entries;
+			std::uint32_t                  hidden = 0;
+			const auto&                    eye = camera->world.translate;
+			for (const auto& [cell, state] : g_cells) {
+				entries.clear();
+				Engine::WalkEntries(cell, entries, hidden);
+				for (const auto& entry : entries) {
+					const auto  object = entry.object;
+					const auto  found = ours.find(object);
+					std::string kind = found != ours.end() ? found->second.kind :
+					                   entry.precombined       ? "precombined" :
+					                   partly.contains(object) ? std::format("partly hidden {}", Engine::ClassName(object)) :
+					                                             std::string(Engine::ClassName(object));
+					if (entry.node9) {
+						kind += " (node 9)";
+					}
+					const auto& bound = object->worldBound;
+					const float distance = std::max(0.0F, eye.GetDistance(bound.center) - bound.fRadius);
+					const auto  ring = static_cast<std::size_t>(std::ranges::upper_bound(kRings, distance) - kRings.begin());
+					if (found != ours.end() && found->second.record && found->second.record->members <= 1 && ring == 0) {
+						nearSolos.emplace_back(distance, found->second.record);
+					}
+					auto&       row = rows[kind];
+					++row.entries[ring];
+					row.meshes[ring] += entry.meshes;
+					row.nearRadius += ring < 2 ? bound.fRadius : 0.0F;
+				}
+			}
+			std::vector<std::pair<std::string, Row>> sorted(rows.begin(), rows.end());
+			std::ranges::sort(sorted, [](const auto& a_l, const auto& a_r) { return a_l.second.meshes[1] + a_l.second.meshes[0] > a_r.second.meshes[1] + a_r.second.meshes[0]; });
+			std::string text;
+			for (const auto& [kind, row] : sorted) {
+				const auto nearEntries = row.entries[0] + row.entries[1];
+				text += std::format("{}{} {} ({}) / {} ({}) / {} ({}) / {} ({}), near radius {:.0f}", text.empty() ? "" : " | ", kind, row.entries[0], row.meshes[0],
+					row.entries[1], row.meshes[1], row.entries[2], row.meshes[2], row.entries[3], row.meshes[3], nearEntries ? row.nearRadius / nearEntries : 0.0);
+			}
+			logger::info("walk census (group-0 entries (meshes) by nearest distance from the camera: under 1500 / 4000 / 14000 / beyond; near radius: mean "
+						 "bound radius under 4000): {}; AppCulled entries skipped {}",
+				text.empty() ? "none"s : text, hidden);
+			// What the nearest solos are: the mesh's name, its material, its bound radius.
+			std::ranges::sort(nearSolos, {}, &std::pair<float, const ChunkRecord*>::first);
+			std::string sample;
+			for (std::size_t i = 0; i < nearSolos.size() && i < 16; ++i) {
+				const auto      record = nearSolos[i].second;
+				Engine::ChunkView view;
+				const bool      read = record->shape && Engine::ReadChunkView(record->shape.get(), record->fadeNode, view);
+				sample += std::format("{}{:.0f}: '{}' {} r={:.0f} ({})", sample.empty() ? "" : " | ", nearSolos[i].first,
+					record->shape ? record->shape->name.c_str() : "?", read && view.material ? view.material : "?",
+					record->shape ? record->shape->worldBound.fRadius : 0.0F,
+					record->alone == kNotAlone ? "not mergeable"sv : AloneName(static_cast<Alone>(record->alone)));
+			}
+			if (!sample.empty()) {
+				logger::info("nearest solos (distance: mesh, material, radius, why alone): {}", sample);
+			}
+		}
+
 		// The blocked parts of the attached cells by class: what keeps references from being hidden whole and
 		// meshes from being combined. Logged when it changed.
 		void LogBlocked()
@@ -1353,13 +1742,21 @@ namespace RC::Combine::Manager
 				}
 			}
 			const auto votes = Gather::Votes();
+			const auto camera = RE::Main::WorldRootCamera();
+			const auto eye = camera ? camera->world.translate : RE::NiPoint3{};
+			const auto version = g_totals.applies * 1000003 + g_totals.reverts * 1009 + g_cells.size() * 7 + (Engine::PrecombinesEnabled() ? 1 : 0);
+			const bool census = version != g_censusVersion || eye.GetDistance(g_censusEye) >= kCensusMove;
+			if (census) {
+				g_censusVersion = version;
+				g_censusEye = eye;
+			}
 			// The engine's own chunks and RC's, for the A/B: how many, and how big (a bound decides how often the sun's
 			// cascades file an object, run 17).
 			std::uint32_t      precombined = 0;
 			std::vector<float> engineRadii, mergedRadii, soloRadii;
 			for (const auto& [cell, state] : g_cells) {
-				precombined += Engine::PrecombinedChunks(cell, &engineRadii);
-				if (state.applied) {
+				precombined += Engine::PrecombinedChunks(cell, census ? &engineRadii : nullptr);
+				if (census && state.applied) {
 					for (const auto& record : state.applied->chunks) {
 						if (record.shape) {
 							(record.members > 1 ? mergedRadii : soloRadii).push_back(record.shape->worldBound.fRadius);
@@ -1379,7 +1776,9 @@ namespace RC::Combine::Manager
 				return std::format("{} (radius mean {:.0f}, median {:.0f}, 90% under {:.0f}, max {:.0f})", a_radii.size(), sum / a_radii.size(),
 					a_radii[a_radii.size() / 2], a_radii[a_radii.size() * 9 / 10], a_radii.back());
 			};
-			logger::info("object sizes: combined chunks {}; solos {}; precombined chunks {}", sizes(mergedRadii), sizes(soloRadii), sizes(engineRadii));
+			if (census) {
+				logger::info("object sizes: combined chunks {}; solos {}; precombined chunks {}", sizes(mergedRadii), sizes(soloRadii), sizes(engineRadii));
+			}
 			logger::info(
 				"summary: {} of {} attached cells combined ({} building, {} not drawn by the main view), {} chunks in the scene, {} originals "
 				"hidden; {}{}{}precombines {} ({} precombined chunks attached){}; applies {}, reverts {} (main view stopped drawing {}), "
@@ -1391,6 +1790,9 @@ namespace RC::Combine::Manager
 			AuditChunks();
 			LogPrevis();
 			LogBlocked();
+			if (census) {
+				LogCensus();
+			}
 		}
 
 		void Reset()
@@ -1402,6 +1804,7 @@ namespace RC::Combine::Manager
 			g_cells.clear();
 			g_hiddenRefs.clear();
 			g_ours.clear();
+			g_parked.clear();
 			g_meshByMesh.clear();
 			logger::info("game load: everything restored and forgotten");
 		}
@@ -1419,6 +1822,7 @@ namespace RC::Combine::Manager
 			if (g_resetPending.exchange(false)) {
 				Reset();
 			}
+			CheckSizing();
 			PollCells();
 			DrainEvents();
 

@@ -1,5 +1,7 @@
 #include "Engine/Engine.h"
 
+#include <unordered_set>
+
 namespace RC::Engine
 {
 	namespace
@@ -501,6 +503,69 @@ namespace RC::Engine
 			}
 		}
 		return count;
+	}
+
+	namespace
+	{
+		std::uint32_t CountMeshes(RE::NiAVObject* a_object)
+		{
+			if (!a_object || a_object->GetAppCulled()) {
+				return 0;
+			}
+			if (a_object->IsGeometry()) {
+				return 1;
+			}
+			const auto    node = a_object->IsNode();
+			std::uint32_t count = 0;
+			if (node) {
+				for (auto& child : node->children) {
+					count += CountMeshes(child.get());
+				}
+			}
+			return count;
+		}
+	}
+
+	void WalkEntries(const RE::TESObjectCELL* a_cell, std::vector<WalkEntry>& a_out, std::uint32_t& a_hidden)
+	{
+		const auto loaded = a_cell ? a_cell->loadedData : nullptr;
+		const auto root = loaded ? loaded->cell3D.get() : nullptr;
+		if (!root || root->children.capacity() <= 9) {
+			return;
+		}
+		std::unordered_set<const RE::NiAVObject*> precombined;
+		RE::NiAVObject* const*                    list = nullptr;
+		std::uint32_t                             count = 0;
+		if (ReadPrecombinedList(a_cell, list, count)) {
+			precombined.insert(list, list + count);
+		}
+		for (const std::uint16_t index : { std::uint16_t{ 3 }, std::uint16_t{ 9 } }) {
+			const auto cellNode = root->children[index].get();
+			const auto node = cellNode ? cellNode->IsNode() : nullptr;
+			const auto add = [&](RE::NiAVObject* a_object) {
+				if (!a_object) {
+					return;
+				}
+				if (a_object->GetAppCulled()) {
+					++a_hidden;
+					return;
+				}
+				a_out.push_back({ a_object, CountMeshes(a_object), precombined.contains(a_object), index == 9 });
+			};
+			if (!node) {
+				continue;
+			}
+			for (auto& pointer : node->children) {
+				const auto child = pointer.get();
+				if (child && IsPlainNode(child) && !child->GetAppCulled()) {
+					for (auto& member : static_cast<RE::NiNode*>(child)->children) {
+						add(member.get());
+					}
+				} else {
+					add(child);
+				}
+			}
+		}
 	}
 
 	const void* CombinedRefs(const RE::TESObjectCELL* a_cell) noexcept

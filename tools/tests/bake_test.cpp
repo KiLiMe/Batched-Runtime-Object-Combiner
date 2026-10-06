@@ -207,6 +207,21 @@ namespace
 			Check(chunk.boundRadius > 200.0F && chunk.boundRadius < 300.0F, "bound covers the members");
 		}
 
+		// Four meshes on a diamond (radius 200): the box's corners are empty, so the bound is the farthest vertex's
+		// distance (~210), not the box's half diagonal (~297).
+		std::vector<Bake::Member> diamond;
+		for (const auto [x, y] : { std::pair{ 200.0F, 0.0F }, std::pair{ 0.0F, 200.0F }, std::pair{ -200.0F, 0.0F }, std::pair{ 0.0F, -200.0F } }) {
+			auto m = members[0];
+			m.toWorld.translate[0] = x;
+			m.toWorld.translate[1] = y;
+			m.center[0] = x + 3;
+			m.center[1] = y + 3;
+			diamond.push_back(m);
+		}
+		auto round = Bake::Cluster(diamond, 1024.0F, 2);
+		Check(round.size() == 1 && Bake::Build(layout, layout, diamond, round[0], 2) && round[0].boundRadius > 200.0F && round[0].boundRadius < 215.0F,
+			"bound radius: the farthest vertex from the box centre");
+
 		// Vertex limit: 30 meshes of 3000 vertices split into chunks of at most 65535.
 		std::vector<std::byte>     big(3000 * layout.stride);
 		std::vector<std::uint16_t> bigIndices(3000);
@@ -234,10 +249,10 @@ namespace
 		}
 		Check(split.size() == 2 && total == 30 && within, "vertex limit splits a grid cell");
 
-		// Clusters are compact, not grid cells: two meshes 100 apart across a multiple of 1024 form a chunk; one 1400
+		// Clusters are compact, not grid cells: two meshes 100 apart across a multiple of 1024 form a chunk; one 2900
 		// away from both stays solo.
 		std::vector<Bake::Member> scattered;
-		for (const float x : { 1000.0F, 1100.0F, 2500.0F }) {
+		for (const float x : { 1000.0F, 1100.0F, 4000.0F }) {
 			Bake::Member m = members[0];
 			m.center[0] = x;
 			scattered.push_back(m);
@@ -257,6 +272,60 @@ namespace
 		const auto wide = Bake::Cluster(stragglers, 1024.0F, 2);
 		Check(wide.size() == 2 && !wide[0].solo && wide[0].members == std::vector<std::uint32_t>{ 0, 1 } && wide[1].solo && wide[1].members[0] == 2,
 			"stragglers within twice the chunk size form a chunk, one beyond stays solo");
+
+		// A straggler whose neighbours were all taken joins the nearest chunk within twice the chunk size: 0 and 100
+		// form a chunk in the compact pass, 1500 (1450 from its centre) is left alone by both passes and joins it.
+		std::vector<Bake::Member> late;
+		for (const float x : { 0.0F, 100.0F, 1500.0F }) {
+			Bake::Member m = members[0];
+			m.center[0] = x;
+			late.push_back(m);
+		}
+		std::uint32_t joined = 0;
+		const auto    joinedChunks = Bake::Cluster(late, 1024.0F, 2, 0.0F, &joined);
+		Check(joinedChunks.size() == 1 && joinedChunks[0].members == std::vector<std::uint32_t>{ 0, 1, 2 } && joined == 1,
+			"a straggler joins the nearest chunk within twice the chunk size");
+
+		// Density (a_spread 3): two big meshes (radius 200) 400 apart merge (reach 600 <= 3 x 252); small ones (radius
+		// 8) 400 apart stay apart (reach 408 > 256 floor, > 3 x 10); small ones 100 apart merge (reach 108 <= floor).
+		const auto density = [&](float a_radius, float a_gap) {
+			std::vector<Bake::Member> pair;
+			for (const float x : { 0.0F, a_gap }) {
+				Bake::Member m = members[0];
+				m.center[0] = x;
+				m.radius = a_radius;
+				pair.push_back(m);
+			}
+			return Bake::Cluster(pair, 1024.0F, 2, 3.0F);
+		};
+		const auto large = density(200.0F, 400.0F);
+		const auto small = density(8.0F, 400.0F);
+		const auto close = density(8.0F, 100.0F);
+		Check(large.size() == 1 && !large[0].solo, "density: big meshes 400 apart merge");
+		Check(small.size() == 2 && small[0].solo && small[1].solo, "density: small meshes 400 apart stay solos");
+		Check(close.size() == 1 && !close[0].solo, "density: small meshes within a quarter chunk merge");
+
+		// Sizing: two meshes 3000 apart stay solos near the eye (beyond twice the chunk size) and merge 8192 away with
+		// growth 2048 (x4: the second pass reaches 8192).
+		const auto sized = [&](float a_eyeX) {
+			std::vector<Bake::Member> pair;
+			for (const float x : { 0.0F, 3000.0F }) {
+				Bake::Member m = members[0];
+				m.center[0] = x;
+				pair.push_back(m);
+			}
+			Bake::Sizing sizing;
+			sizing.eye[0] = a_eyeX;
+			sizing.growth = 2048.0F;
+			return Bake::Cluster(pair, 1024.0F, 2, 0.0F, nullptr, sizing);
+		};
+		const auto nearEye = sized(1500.0F);
+		const auto farEye = sized(-8192.0F);
+		Check(nearEye.size() == 2 && nearEye[0].solo && nearEye[1].solo, "sizing: near the eye, meshes 3000 apart stay solos");
+		Check(farEye.size() == 1 && !farEye[0].solo, "sizing: far from the eye, the same meshes merge");
+		Bake::Sizing off;
+		const float  at[3]{ 100000.0F, 0.0F, 0.0F };
+		Check(off.At(at) == 1.0F, "sizing: growth 0 keeps x1");
 
 		// A member with an out-of-range index is left out.
 		std::uint16_t bad[3]{ 0, 1, 7 };

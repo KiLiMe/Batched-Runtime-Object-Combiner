@@ -66,6 +66,9 @@ namespace RC::Vertex
 	// normal and tangent are copied unchanged. a_min / a_max grow to include every written position.
 	void Transform(const Layout& a_from, const std::byte* a_src, const Layout& a_to, std::byte* a_dst, std::uint32_t a_count, const Affine& a_affine, float a_min[3], float a_max[3]) noexcept;
 
+	// One vertex's position (x, y, z, w = bitangent x).
+	void ReadPosition(const std::byte* a_vertex, const Layout& a_layout, float a_out[4]) noexcept;
+
 	// The packed byte <-> float mapping of normals and tangents.
 	[[nodiscard]] float         ByteToUnit(std::uint8_t a_byte) noexcept;
 	[[nodiscard]] std::uint8_t  UnitToByte(float a_value) noexcept;

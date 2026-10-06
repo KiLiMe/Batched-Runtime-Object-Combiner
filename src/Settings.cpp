@@ -58,16 +58,22 @@ namespace RC
 		settleFrames = std::clamp(ReadUInt(path, L"Combine", L"iSettleFrames", settleFrames), 1u, 600u);
 		gatherBudgetMs = std::clamp(ReadFloat(path, L"Combine", L"fGatherBudgetMs", gatherBudgetMs), 0.1F, 50.0F);
 		chunkFadeNodes = ReadBool(path, L"Combine", L"bChunkFadeNodes", chunkFadeNodes);
+		parkHidden = ReadBool(path, L"Combine", L"bParkHidden", parkHidden);
+		chunkGrowth = ReadFloat(path, L"Combine", L"fChunkGrowth", chunkGrowth);
+		chunkGrowth = chunkGrowth <= 0.0F ? 0.0F : std::clamp(chunkGrowth, 256.0F, 65536.0F);
+		clusterSpread = std::clamp(ReadFloat(path, L"Combine", L"fClusterSpread", clusterSpread), 0.0F, 100.0F);
+		groupSize = ReadFloat(path, L"Combine", L"fGroupSize", groupSize);
+		groupSize = groupSize < 0.0F ? -1.0F : groupSize == 0.0F ? 0.0F : std::clamp(groupSize, 256.0F, 65536.0F);
 
 		logCells = ReadBool(path, L"Debug", L"bLogCells", logCells);
 		watchdogRefsPerFrame = std::clamp(ReadUInt(path, L"Debug", L"iWatchdogRefsPerFrame", watchdogRefsPerFrame), 16u, 1u << 20);
 
 		logger::info(
 			"settings ({}): enabled {}, disablePrecombines {}, apply {}, toggleHotkey 0x{:X}, notify {}, "
-			"chunkSize {}, maxShapeRadius {}, minShapesPerChunk {}, settleFrames {}, gatherBudgetMs {}, chunkFadeNodes {}, logCells {}, "
-			"watchdogRefsPerFrame {}",
+			"chunkSize {}, maxShapeRadius {}, minShapesPerChunk {}, settleFrames {}, gatherBudgetMs {}, chunkFadeNodes {}, parkHidden {}, "
+			"chunkGrowth {}, clusterSpread {}, groupSize {}, logCells {}, watchdogRefsPerFrame {}",
 			exists ? "RuntimeCombiner.ini" : "defaults, no RuntimeCombiner.ini",
 			enabled, disablePrecombines, apply, toggleHotkey, notify,
-			chunkSize, maxShapeRadius, minShapesPerChunk, settleFrames, gatherBudgetMs, chunkFadeNodes, logCells, watchdogRefsPerFrame);
+			chunkSize, maxShapeRadius, minShapesPerChunk, settleFrames, gatherBudgetMs, chunkFadeNodes, parkHidden, chunkGrowth, clusterSpread, groupSize, logCells, watchdogRefsPerFrame);
 	}
 }

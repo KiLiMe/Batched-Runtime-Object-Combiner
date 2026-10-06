@@ -8,25 +8,25 @@
 
 namespace RC::Vertex
 {
-	namespace
-	{
-		using DirectX::PackedVector::XMConvertFloatToHalf;
-		using DirectX::PackedVector::XMConvertHalfToFloat;
+	using DirectX::PackedVector::XMConvertFloatToHalf;
+	using DirectX::PackedVector::XMConvertHalfToFloat;
 
-		void ReadPosition(const std::byte* a_vertex, const Layout& a_layout, float a_out[4]) noexcept
-		{
-			const auto at = a_vertex + a_layout.position;
-			if (a_layout.fullPrecision) {
-				std::memcpy(a_out, at, sizeof(float) * 4);
-			} else {
-				std::uint16_t half[4];
-				std::memcpy(half, at, sizeof(half));
-				for (int i = 0; i < 4; ++i) {
-					a_out[i] = XMConvertHalfToFloat(half[i]);
-				}
+	void ReadPosition(const std::byte* a_vertex, const Layout& a_layout, float a_out[4]) noexcept
+	{
+		const auto at = a_vertex + a_layout.position;
+		if (a_layout.fullPrecision) {
+			std::memcpy(a_out, at, sizeof(float) * 4);
+		} else {
+			std::uint16_t half[4];
+			std::memcpy(half, at, sizeof(half));
+			for (int i = 0; i < 4; ++i) {
+				a_out[i] = XMConvertHalfToFloat(half[i]);
 			}
 		}
+	}
 
+	namespace
+	{
 		void WritePosition(std::byte* a_vertex, const Layout& a_layout, const float a_in[4]) noexcept
 		{
 			const auto at = a_vertex + a_layout.position;

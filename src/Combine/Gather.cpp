@@ -88,7 +88,8 @@ namespace RC::Combine::Gather
 			std::uint64_t   shaderFlags{ 0 };
 			std::uint32_t   alphaKey{ 0 };
 			std::uint64_t   objectKey{ 0 };
-			bool            cloneOnly{ false };  // drawn by a clone of it (a solo chunk), never merged
+			bool            cloneOnly{ false };   // drawn by a clone of it (a solo chunk), never merged
+			bool            copiesOnly{ false };  // merged only with copies of the same mesh
 			Bake::Member    member;
 		};
 
@@ -183,8 +184,9 @@ namespace RC::Combine::Gather
 			// be hidden whole and leave previs's dynamic objects (FO4-ENGINE-NOTES 5.5d). Not when a property animates:
 			// the clone gets a copy of it (Engine::Clone), and nothing would run the copy's controller.
 			const auto alpha = *Field<std::byte*>(a_shape, Offset::kAlphaProperty);
+			const bool animated = *Field<void*>(property, Offset::kControllers) || (alpha && *Field<void*>(alpha, Offset::kControllers));
 			const auto clone = [&](Skip a_skip) {
-				if (*Field<void*>(property, Offset::kControllers) || (alpha && *Field<void*>(alpha, Offset::kControllers))) {
+				if (animated) {
 					a_stats.Count(a_skip);
 					return Fit::kKeep;
 				}
@@ -192,9 +194,11 @@ namespace RC::Combine::Gather
 				a_out.cloneOnly = true;
 				return Fit::kClone;
 			};
-			if (!IsLightingShader(property)) {
-				return clone(Skip::kShader);
-			}
+			// Effect shaders and alpha blending merge only with copies of the same mesh (one renderer data, an equal
+			// property), as a precombined mesh bakes each source shape's instances into one mesh (FO4-ENGINE-NOTES
+			// 7.4): blended copies then draw in one fixed order, as they do there. Different meshes don't merge.
+			const bool     lighting = IsLightingShader(property);
+			auto           copiesOnly = lighting ? Skip::kCount : Skip::kShader;
 			const auto     desc = *Field<std::uint64_t>(rendererData, 0);
 			Vertex::Layout layout;
 			std::uint64_t  chunkDesc = 0;
@@ -231,18 +235,27 @@ namespace RC::Combine::Gather
 			// The persistent alpha, not the property's +0x28: that is a draw-time cache of material alpha x fade,
 			// stale for any mesh last drawn mid-fade (FO4-ENGINE-NOTES 7.8). A load fade-in is no reason to leave a
 			// mesh out: the chunk is drawn at full alpha at once, or with bChunkFadeNodes its fade node carries the
-			// fade-in on (Manager's Apply).
+			// fade-in on (Manager's Apply). Lighting materials only: the offset is BSLightingShaderMaterialBase's.
 			const auto material = *Field<std::byte*>(property, Offset::kShaderMaterial);
-			if (!material || *Field<float>(material, Offset::kMaterialAlpha) < 1.0F || *Field<float>(property, Offset::kShaderLODFade) != 1.0F) {
+			if (!material || (lighting && *Field<float>(material, Offset::kMaterialAlpha) < 1.0F) || *Field<float>(property, Offset::kShaderLODFade) != 1.0F) {
 				return clone(Skip::kShaderAlpha);
 			}
 			std::uint32_t alphaKey = 0;
 			if (alpha) {
 				const auto alphaFlags = *Field<std::uint16_t>(alpha, Offset::kAlphaFlags);
-				if (alphaFlags & 1) {
-					return clone(Skip::kAlphaBlend);
+				if ((alphaFlags & 1) && copiesOnly == Skip::kCount) {
+					copiesOnly = Skip::kAlphaBlend;
 				}
 				alphaKey = 0x80000000u | (static_cast<std::uint32_t>(alphaFlags) << 8) | *Field<std::uint8_t>(alpha, Offset::kAlphaThreshold);
+			}
+			if (copiesOnly != Skip::kCount) {
+				// The chunk draws with a clone of one copy's property: a controller on it would not run.
+				if (animated) {
+					a_stats.Count(copiesOnly);
+					return Fit::kKeep;
+				}
+				a_stats.CountCopies(copiesOnly);
+				a_out.copiesOnly = true;
 			}
 
 			a_out.desc = desc;
@@ -307,8 +320,9 @@ namespace RC::Combine::Gather
 			return (static_cast<std::uint32_t>(a_range.type) << 16) | step;
 		}
 
-		// Bucket: the engine's merge test (BSLightingShaderProperty::CanMerge) plus what the bake must keep equal.
-		// The hash narrows the CanMerge calls to properties with the same flags and material name.
+		// Bucket: the engine's merge test (BSShaderProperty::CanMerge, the lighting override for lighting properties)
+		// plus what the bake must keep equal; copies-only meshes also share one renderer data. The hash narrows the
+		// CanMerge calls to properties with the same flags and material name.
 		Bucket& BucketFor(const Candidate& a_candidate, RE::NiNode* a_parent, std::uint32_t a_fadeKey, const FadeRange& a_fade, Job& a_job,
 			std::unordered_map<std::uint64_t, std::vector<std::uint32_t>>& a_index)
 		{
@@ -342,14 +356,18 @@ namespace RC::Combine::Gather
 			key = Mix(key, a_candidate.alphaKey);
 			key = Mix(key, a_candidate.objectKey);
 			key = Mix(key, fadeKey);
-			auto& list = a_index[key];
+			const auto rendererData = a_candidate.copiesOnly ? a_candidate.rendererData : nullptr;
+			key = Mix(key, reinterpret_cast<std::uintptr_t>(rendererData));
+			const bool lighting = IsLightingShader(a_candidate.property);
+			auto&      list = a_index[key];
 			for (const auto index : list) {
 				auto& bucket = a_job.buckets[index];
 				// CanMerge leaves out what BSLightingShaderProperty::CopyMembers also copies at +0x70..+0x8C (eight
 				// floats), and the chunk draws with one member's property: those must match too.
-				if (!bucket.cloneOnly && bucket.parent == a_parent && bucket.desc == a_candidate.desc && bucket.alphaKey == a_candidate.alphaKey &&
-					bucket.objectKey == a_candidate.objectKey && bucket.fadeKey == fadeKey &&
-					std::memcmp(Field(bucket.property, 0x70), Field(a_candidate.property, 0x70), 0x20) == 0 &&
+				if (!bucket.cloneOnly && bucket.copiesOnly == a_candidate.copiesOnly && bucket.rendererData == rendererData &&
+					bucket.parent == a_parent && bucket.desc == a_candidate.desc && bucket.alphaKey == a_candidate.alphaKey &&
+					bucket.objectKey == a_candidate.objectKey && bucket.fadeKey == fadeKey && IsLightingShader(bucket.property) == lighting &&
+					(!lighting || std::memcmp(Field(bucket.property, 0x70), Field(a_candidate.property, 0x70), 0x20) == 0) &&
 					CanMerge(bucket.property, a_candidate.property)) {
 					bucket.fadeNear = std::max(bucket.fadeNear, a_fade.nearDistance);
 					bucket.fadeFar = std::max(bucket.fadeFar, a_fade.farDistance);
@@ -366,6 +384,8 @@ namespace RC::Combine::Gather
 			bucket.property = a_candidate.property;
 			bucket.alphaKey = a_candidate.alphaKey;
 			bucket.objectKey = a_candidate.objectKey;
+			bucket.copiesOnly = a_candidate.copiesOnly;
+			bucket.rendererData = rendererData;
 			bucket.fadeKey = fadeKey;
 			bucket.fadeNear = a_fade.nearDistance;
 			bucket.fadeFar = a_fade.farDistance;
@@ -374,7 +394,7 @@ namespace RC::Combine::Gather
 		}
 	}
 
-	void Cell(RE::TESObjectCELL* a_cell, const HiddenSet& a_ours, const FormSet& a_meshByMesh, Job& a_job)
+	void Cell(RE::TESObjectCELL* a_cell, const HiddenSet& a_ours, const ParkedMap& a_parked, const FormSet& a_meshByMesh, Job& a_job)
 	{
 		const auto start = std::chrono::steady_clock::now();
 		const auto& settings = Settings::Get();
@@ -422,7 +442,7 @@ namespace RC::Combine::Gather
 				stats.Count(Skip::kRefFaded);
 				continue;
 			}
-			const auto parent = root->parent;
+			const auto parent = HomeOf(root->parent, a_parked);
 			if (!parent || !IsIdentity(parent->world)) {
 				stats.Count(Skip::kRefParent);
 				continue;

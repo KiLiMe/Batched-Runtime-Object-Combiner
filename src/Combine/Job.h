@@ -24,10 +24,10 @@ namespace RC::Combine
 		kFormat,         // vertex format the bake doesn't handle
 		kStride,         // a stride too wide to grow by 8 for full-precision positions
 		kNoCpuCopy,      // no CPU copy of the vertices / indices, or sizes that don't add up
-		kShader,         // not BSLightingShaderProperty
+		kShader,         // not BSLightingShaderProperty (a BSEffectShaderProperty: merged only with copies of its mesh)
 		kShaderFlags,    // a shader that moves vertices, reads model space or renders outside the opaque passes
 		kShaderAlpha,    // translucent: material alpha or LOD fade below 1 (not the load fade-in, which chunks redo)
-		kAlphaBlend,     // alpha blending (draw order matters)
+		kAlphaBlend,     // alpha blending (draw order matters: merged only with copies of its mesh)
 		kTooBig,         // bound radius above fMaxShapeRadius
 		kTransform,      // world bound doesn't match the world transform (rotation convention check)
 		kNonCaster,      // flag bit 40 (casts no shadow): Addictol's previs feed drops such records
@@ -44,16 +44,45 @@ namespace RC::Combine
 		return names[static_cast<std::size_t>(a_skip)];
 	}
 
+	// Why a mergeable mesh was left a solo, from the nearest other mesh of its material under the same parent.
+	enum class Alone : std::uint32_t
+	{
+		kUnique,      // no other mesh of its material
+		kFar,         // the nearest is beyond the second pass's reach (2 x fChunkSize)
+		kSameGroup,   // the nearest is in its own bucket, in a chunk whose centre is out of reach or that is full
+		kCopies,      // copies-only (effect shader, blending) and no copy of it in reach
+		kFade,        // the nearest is in a bucket of another distance-fade class
+		kFormat,      // ... another vertex format
+		kAlpha,       // ... other alpha flags or threshold
+		kShadowBits,  // ... other NiAVObject shadow bits
+		kProperty,    // ... a property that doesn't merge with it (flags, +0x70 values, CanMerge)
+		kCount
+	};
+
+	[[nodiscard]] constexpr std::string_view AloneName(Alone a_alone) noexcept
+	{
+		constexpr std::array<std::string_view, static_cast<std::size_t>(Alone::kCount)> names{
+			"unique material"sv, "same material farther"sv, "own group's chunks farther or full"sv, "no copy near"sv, "fade class"sv, "vertex format"sv, "alpha"sv,
+			"shadow bits"sv, "property"sv
+		};
+		return names[static_cast<std::size_t>(a_alone)];
+	}
+
 	struct Stats
 	{
 		std::array<std::uint32_t, static_cast<std::size_t>(Skip::kCount)> skips{};
 		std::array<std::uint32_t, static_cast<std::size_t>(Skip::kCount)> cloned{};  // not mergeable, drawn by a solo clone
+		std::array<std::uint32_t, static_cast<std::size_t>(Skip::kCount)> copies{};  // merged only with copies of the same mesh
 		std::uint32_t references{ 0 };       // in the cell's list
 		std::uint32_t candidates{ 0 };       // references with at least one captured mesh
 		std::uint32_t capturedShapes{ 0 };
 		std::uint32_t chunks{ 0 };           // combined meshes built
 		std::uint32_t bakedShapes{ 0 };      // meshes they replace
 		std::uint32_t solos{ 0 };            // meshes alone in their chunk: cloned as they are (Bake::Chunk::solo)
+		std::uint32_t copyChunks{ 0 };       // chunks of same-mesh copies (Bucket::copiesOnly), among chunks
+		std::uint32_t copyShapes{ 0 };       // the copies they replace, among bakedShapes
+		std::uint32_t joined{ 0 };           // stragglers that joined a nearby chunk (Bake::Cluster)
+		std::array<std::uint32_t, static_cast<std::size_t>(Alone::kCount)> alone{};  // mergeable solos by reason
 		std::uint32_t precombinedRefs{ 0 };  // captured references the cell's precombines list (one fade class)
 		std::uint32_t triangles{ 0 };
 		std::uint32_t vertices{ 0 };
@@ -68,6 +97,7 @@ namespace RC::Combine
 
 		void Count(Skip a_skip) noexcept { ++skips[static_cast<std::size_t>(a_skip)]; }
 		void CountCloned(Skip a_skip) noexcept { ++cloned[static_cast<std::size_t>(a_skip)]; }
+		void CountCopies(Skip a_skip) noexcept { ++copies[static_cast<std::size_t>(a_skip)]; }
 		void CountBlocked(const char* a_class)
 		{
 			Count(Skip::kBlocked);
@@ -116,6 +146,8 @@ namespace RC::Combine
 		float                      fadeFar{ 0.0F };
 		std::uint8_t               fadeType{ 0 };        // their fade nodes' LOD-mult type
 		bool                       cloneOnly{ false };   // members that can't merge: each is a solo chunk
+		bool                       copiesOnly{ false };  // copies of one mesh (rendererData) that merge only with each other
+		const void*                rendererData{ nullptr };
 		std::vector<std::uint32_t> shapes;               // indices into Job::shapes, parallel to members
 		std::vector<Bake::Member>  members;
 		std::vector<Bake::Chunk>   chunks;               // the worker's output
@@ -128,6 +160,8 @@ namespace RC::Combine
 		RE::TESObjectCELL*       cell{ nullptr };
 		std::uint32_t            cellFormID{ 0 };
 		std::uint64_t            generation{ 0 };
+		float                    chunkSize{ 0.0F };  // fChunkSize at gather
+		Bake::Sizing             sizing;             // the player's position at gather and fChunkGrowth
 		std::vector<SourceRef>   refs;
 		std::vector<SourceShape> shapes;
 		std::vector<Bucket>      buckets;

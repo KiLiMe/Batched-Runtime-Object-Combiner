@@ -40,16 +40,42 @@ namespace RC::Bake
 			return solo;
 		}
 
-		// One greedy pass: a seed takes every free candidate whose bound centre lies within a_radius of its own, at most
-		// kMaxVertices vertices. Clusters of at least a_minMembers go to a_chunks; the members of smaller ones are
-		// returned. The candidates are bucketed in cells of the radius, so the 3x3x3 cells around a seed's hold every
-		// one in reach.
-		std::vector<std::uint32_t> ClusterPass(std::span<const Member> a_members, std::vector<std::uint32_t> a_candidates, float a_radius,
-			std::uint32_t a_minMembers, std::vector<Chunk>& a_chunks)
+		// How far a cluster may reach for what it holds (Cluster's a_spread). Scattered small meshes merged into one wide
+		// sphere are judged by that sphere: the sun's cascades file it and CBRO keeps its shadow wherever the sphere's
+		// would land, though the meshes in it are small. RC's chunks of radius 256-512 took ~2.6x the precombines'
+		// registrations of that size in the far cascade (run 34's probe), with fewer main-view draws.
+		struct Density
 		{
-			const auto cellOf = [&](const Member& a_m) {
-				return Key{ static_cast<std::int32_t>(std::floor(a_m.center[0] / a_radius)), static_cast<std::int32_t>(std::floor(a_m.center[1] / a_radius)),
-					static_cast<std::int32_t>(std::floor(a_m.center[2] / a_radius)) };
+			float floor{ 0.0F };
+			float factor{ 0.0F };
+
+			[[nodiscard]] bool Fits(float a_reach, double a_volume) const noexcept
+			{
+				return factor <= 0.0F || a_reach <= std::max(floor, factor * static_cast<float>(std::cbrt(a_volume)));
+			}
+		};
+
+		[[nodiscard]] double Cube(float a_radius) noexcept
+		{
+			return static_cast<double>(a_radius) * a_radius * a_radius;
+		}
+
+		// One greedy pass: a seed takes the free candidates whose bound centres lie within a_radius of its own, nearest
+		// first, at most kMaxVertices vertices, while the cluster stays dense (a_density). Clusters of at least
+		// a_minMembers go to a_chunks; the members of smaller ones are returned. The candidates are bucketed in cells of
+		// the radius, so the 3x3x3 cells around a seed's hold every one in reach.
+		std::vector<std::uint32_t> ClusterPass(std::span<const Member> a_members, std::vector<std::uint32_t> a_candidates, float a_radius,
+			std::uint32_t a_minMembers, const Density& a_density, const Sizing& a_sizing, std::vector<Chunk>& a_chunks)
+		{
+			// Buckets as wide as the largest radius any seed gets, so the 3x3x3 around a seed's still hold its reach.
+			float grown = 1.0F;
+			for (const auto index : a_candidates) {
+				grown = std::max(grown, a_sizing.At(a_members[index].center));
+			}
+			const float cell = a_radius * grown;
+			const auto  cellOf = [&](const Member& a_m) {
+				return Key{ static_cast<std::int32_t>(std::floor(a_m.center[0] / cell)), static_cast<std::int32_t>(std::floor(a_m.center[1] / cell)),
+					static_cast<std::int32_t>(std::floor(a_m.center[2] / cell)) };
 			};
 			std::map<Key, std::vector<std::uint32_t>> cells;
 			for (const auto index : a_candidates) {
@@ -62,16 +88,17 @@ namespace RC::Bake
 				return lhs != rhs ? lhs < rhs : a_members[a_lhs].center[0] < a_members[a_rhs].center[0];
 			});
 
-			std::vector<std::uint32_t> alone;
-			std::vector<bool>          taken(a_members.size(), false);
+			std::vector<std::uint32_t>                 alone;
+			std::vector<bool>                          taken(a_members.size(), false);
+			std::vector<std::pair<float, std::uint32_t>> inReach;
 			for (const auto seed : a_candidates) {
 				if (taken[seed]) {
 					continue;
 				}
-				const auto&   s = a_members[seed];
-				const auto    home = cellOf(s);
-				Chunk         chunk;
-				std::uint32_t vertices = 0;
+				const auto& s = a_members[seed];
+				const auto  home = cellOf(s);
+				const float radius = a_radius * a_sizing.At(s.center);
+				inReach.clear();
 				for (std::int32_t dx = -1; dx <= 1; ++dx) {
 					for (std::int32_t dy = -1; dy <= 1; ++dy) {
 						for (std::int32_t dz = -1; dz <= 1; ++dz) {
@@ -82,15 +109,32 @@ namespace RC::Bake
 							for (const auto index : found->second) {
 								const auto& m = a_members[index];
 								const float d[3]{ m.center[0] - s.center[0], m.center[1] - s.center[1], m.center[2] - s.center[2] };
-								if (taken[index] || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > a_radius * a_radius || vertices + m.vertexCount > kMaxVertices) {
-									continue;
+								const float distance2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+								if (!taken[index] && index != seed && distance2 <= radius * radius) {
+									inReach.emplace_back(distance2, index);
 								}
-								taken[index] = true;
-								chunk.members.push_back(index);
-								vertices += m.vertexCount;
 							}
 						}
 					}
+				}
+				std::ranges::sort(inReach);
+				Chunk         chunk;
+				std::uint32_t vertices = s.vertexCount;
+				float         reach = s.radius;
+				double        volume = Cube(s.radius);
+				taken[seed] = true;
+				chunk.members.push_back(seed);
+				for (const auto& [distance2, index] : inReach) {
+					const auto& m = a_members[index];
+					const float memberReach = std::max(reach, std::sqrt(distance2) + m.radius);
+					if (vertices + m.vertexCount > kMaxVertices || !a_density.Fits(memberReach, volume + Cube(m.radius))) {
+						continue;
+					}
+					taken[index] = true;
+					chunk.members.push_back(index);
+					vertices += m.vertexCount;
+					reach = memberReach;
+					volume += Cube(m.radius);
 				}
 				if (chunk.members.size() >= a_minMembers) {
 					std::ranges::sort(chunk.members);
@@ -103,6 +147,15 @@ namespace RC::Bake
 		}
 	}
 
+	float Sizing::At(const float a_point[3]) const noexcept
+	{
+		if (growth <= 0.0F) {
+			return 1.0F;
+		}
+		const float d[3]{ a_point[0] - eye[0], a_point[1] - eye[1], a_point[2] - eye[2] };
+		return std::clamp(std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) / growth, 1.0F, kMaxGrowth);
+	}
+
 	std::vector<Chunk> Solos(std::span<const Member> a_members)
 	{
 		std::vector<Chunk> solos;
@@ -112,8 +165,10 @@ namespace RC::Bake
 		return solos;
 	}
 
-	std::vector<Chunk> Cluster(std::span<const Member> a_members, float a_chunkSize, std::uint32_t a_minMembers)
+	std::vector<Chunk> Cluster(std::span<const Member> a_members, float a_chunkSize, std::uint32_t a_minMembers, float a_spread, std::uint32_t* a_joined,
+		const Sizing& a_sizing)
 	{
+		const Density density{ a_chunkSize * 0.25F, a_spread };
 		std::vector<std::uint32_t> candidates;
 		for (std::uint32_t i = 0; i < a_members.size(); ++i) {
 			const auto& m = a_members[i];
@@ -125,12 +180,62 @@ namespace RC::Bake
 		// get a second pass within twice the chunk size (about a cell; precombined chunks reach bound radius 5,200): left
 		// as solo clones they were 10,461 of Runtime Combiner's 22,473 objects against 18,971 precombined chunks (run 20).
 		std::vector<Chunk> chunks;
-		auto               alone = ClusterPass(a_members, std::move(candidates), a_chunkSize * 0.5F, a_minMembers, chunks);
-		alone = ClusterPass(a_members, std::move(alone), a_chunkSize * 2.0F, a_minMembers, chunks);
+		auto               alone = ClusterPass(a_members, std::move(candidates), a_chunkSize * 0.5F, a_minMembers, density, a_sizing, chunks);
+		alone = ClusterPass(a_members, std::move(alone), a_chunkSize * 2.0F, a_minMembers, density, a_sizing, chunks);
 
+		// A member is left alone when every neighbour went to an earlier seed's chunk: it joins the chunk whose
+		// members' centre is nearest, within the second pass's reach. Left as solos, such meshes made RC's scene ~15%
+		// more objects near the camera than the precombines' at an equal count of chunks (run 27's census).
+		struct Centre
+		{
+			float         at[3]{};
+			std::uint32_t vertices{ 0 };
+			float         reach{ 0.0F };  // the farthest member bound from the centre
+			double        volume{ 0.0 };
+		};
+		const auto distance = [](const float a_a[3], const float a_b[3]) {
+			const float d[3]{ a_a[0] - a_b[0], a_a[1] - a_b[1], a_a[2] - a_b[2] };
+			return std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+		};
+		std::vector<Centre> centres(chunks.size());
+		for (std::size_t c = 0; c < chunks.size(); ++c) {
+			for (const auto index : chunks[c].members) {
+				for (int i = 0; i < 3; ++i) {
+					centres[c].at[i] += a_members[index].center[i] / static_cast<float>(chunks[c].members.size());
+				}
+				centres[c].vertices += a_members[index].vertexCount;
+				centres[c].volume += Cube(a_members[index].radius);
+			}
+			for (const auto index : chunks[c].members) {
+				centres[c].reach = std::max(centres[c].reach, distance(a_members[index].center, centres[c].at) + a_members[index].radius);
+			}
+		}
 		std::vector<Chunk> solos;
 		for (const auto index : alone) {
-			solos.push_back(SoloOf(a_members, index));
+			const auto& m = a_members[index];
+			std::size_t best = chunks.size();
+			float       bestDistance = std::numeric_limits<float>::max();
+			for (std::size_t c = 0; c < chunks.size(); ++c) {
+				const float d[3]{ m.center[0] - centres[c].at[0], m.center[1] - centres[c].at[1], m.center[2] - centres[c].at[2] };
+				const float distance2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+				const float reach = a_chunkSize * 2.0F * a_sizing.At(centres[c].at);
+				if (distance2 <= reach * reach && distance2 <= bestDistance && centres[c].vertices + m.vertexCount <= kMaxVertices &&
+					density.Fits(std::max(centres[c].reach, distance(m.center, centres[c].at) + m.radius), centres[c].volume + Cube(m.radius))) {
+					best = c;
+					bestDistance = distance2;
+				}
+			}
+			if (best == chunks.size()) {
+				solos.push_back(SoloOf(a_members, index));
+				continue;
+			}
+			chunks[best].members.insert(std::ranges::upper_bound(chunks[best].members, index), index);
+			centres[best].vertices += m.vertexCount;
+			centres[best].reach = std::max(centres[best].reach, distance(m.center, centres[best].at) + m.radius);
+			centres[best].volume += Cube(m.radius);
+			if (a_joined) {
+				++*a_joined;
+			}
 		}
 
 		// The origin is the centre of the members' bounding box: the smallest offsets, the finest position steps.
@@ -217,14 +322,17 @@ namespace RC::Bake
 		a_chunk.vertexCount = vertexBase;
 		a_chunk.triangleCount = indexBase / 3;
 
-		// Bound: the box centre, radius to the farthest written vertex.
+		// Bound: the box centre, radius to the farthest written vertex. The box's half diagonal overshoots a cluster
+		// by up to ~40% (its corners are mostly empty), and the sun's cascades file a chunk by its bound (run 25).
 		for (int i = 0; i < 3; ++i) {
 			a_chunk.boundCenter[i] = 0.5F * (lo[i] + hi[i]);
 		}
 		float radius = 0.0F;
-		for (int i = 0; i < 3; ++i) {
-			const float half = 0.5F * (hi[i] - lo[i]);
-			radius += half * half;
+		for (std::uint32_t v = 0; v < vertexBase; ++v) {
+			float p[4];
+			Vertex::ReadPosition(a_chunk.vertices.data() + static_cast<std::size_t>(v) * a_to.stride, a_to, p);
+			const float d[3]{ p[0] - a_chunk.boundCenter[0], p[1] - a_chunk.boundCenter[1], p[2] - a_chunk.boundCenter[2] };
+			radius = std::max(radius, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
 		}
 		a_chunk.boundRadius = std::sqrt(radius);
 		return true;

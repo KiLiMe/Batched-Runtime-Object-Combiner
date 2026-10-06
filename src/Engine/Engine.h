@@ -186,6 +186,19 @@ namespace RC::Engine
 	[[nodiscard]] std::uint32_t PrecombinedChunks(const RE::TESObjectCELL* a_cell, std::vector<float>* a_radii = nullptr);
 	void               SetPrecombinesEnabled(bool a_enabled) noexcept;
 
+	// One group-0 entry of the scene walk (FO4-ENGINE-NOTES 5.3), for the census.
+	struct WalkEntry
+	{
+		RE::NiAVObject* object{ nullptr };
+		std::uint32_t   meshes{ 0 };           // BSGeometry under it that aren't AppCulled (what a fade node files)
+		bool            precombined{ false };  // one of the cell's precombined chunks (7.12)
+		bool            node9{ false };        // under cell child 9 (bit-30 precombined art)
+	};
+	// The walk's group-0 entries in a_cell's 3D: of the cell node's children 3 and 9, an exact NiNode child is a
+	// container whose own children are entries, anything else is one. AppCulled ones the walk skips: counted in
+	// a_hidden. Main thread.
+	void WalkEntries(const RE::TESObjectCELL* a_cell, std::vector<WalkEntry>& a_out, std::uint32_t& a_hidden);
+
 	// What the renderer made of one chunk at the last cull (read only, under SEH; FO4-ENGINE-NOTES 5.3, 7.6-7.9).
 	struct ChunkView
 	{
@@ -235,6 +248,7 @@ namespace RC::Engine
 	[[nodiscard]] bool InstallPrevisQueryHook(void (*a_after)());
 	// Milliseconds the engine's previs query took since the last call, and how many times it ran (main thread).
 	[[nodiscard]] double TakePrevisQueryTime(std::uint32_t& a_calls) noexcept;
+
 
 	// Wraps the cell-buffer purge in Main::PerformGameReset (a save load or new game): a_after runs once every cell
 	// is cleared and purged, before the next world loads, the one point where the precombine switch may change
