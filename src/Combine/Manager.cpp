@@ -57,6 +57,7 @@ namespace RC::Combine::Manager
 			World                            world;
 			std::uint32_t                    children{ kNoChildCount };  // a hidden node root's child count
 			bool                             unregistered{ false };  // taken out of previs's dynamic objects while hidden
+			bool                             culled{ true };  // AppCulled by us; false: a root that owns collision (Apply)
 		};
 
 		// What the watchdog found.
@@ -480,7 +481,7 @@ namespace RC::Combine::Manager
 				}
 			}
 			for (auto& hidden : applied->hidden) {
-				if (hidden.object && hidden.object->GetAppCulled()) {
+				if (hidden.culled && hidden.object && hidden.object->GetAppCulled()) {
 					hidden.object->SetAppCulled(false);
 				}
 				if (a_carry && hidden.unregistered) {
@@ -748,12 +749,12 @@ namespace RC::Combine::Manager
 			logger::info(
 				"cell {} {} (chunk size {:.0f}-{:.0f}): {} references, {} with meshes captured ({} meshes), {} of them listed as precombined; {} chunks replace {} meshes ({} tris, {} verts, {:.1f} MB), "
 				"{} of them copies of one mesh ({} meshes; copy-only meshes: {}), {} stragglers joined a nearby chunk, {} meshes alone cloned as they "
-				"are (not mergeable: {}; mergeable, alone: {}); {} references hidden whole, {} partly; gather {:.2f} ms, bake {:.2f} ms (worker), apply "
+				"are (not mergeable: {}; mergeable, alone: {}); {} references hidden whole ({} of them by their meshes: the root owns collision), {} partly; gather {:.2f} ms, bake {:.2f} ms (worker), apply "
 				"{:.2f} ms; left out: {}",
 				CellName(a_job.cell, a_job.cellFormID), a_what, a_job.chunkSize * FactorRange(a_job.cell, a_job.sizing).first,
 				a_job.chunkSize * FactorRange(a_job.cell, a_job.sizing).second, s.references, s.candidates, s.capturedShapes, s.precombinedRefs, s.chunks, s.bakedShapes,
 				s.triangles, s.vertices, static_cast<double>(s.vertexBytes) / (1 << 20), s.copyChunks, s.copyShapes, SkipSummary(s.copies), s.joined,
-				s.solos, SkipSummary(s.cloned), AloneSummary(s.alone), s.wholeRefs, s.partialRefs, s.gatherMs, s.bakeMs, s.applyMs, SkipSummary(s.skips));
+				s.solos, SkipSummary(s.cloned), AloneSummary(s.alone), s.wholeRefs, s.solidRefs, s.partialRefs, s.gatherMs, s.bakeMs, s.applyMs, SkipSummary(s.skips));
 		}
 
 		// ---- previs --------------------------------------------------------------------------------------------
@@ -1059,10 +1060,16 @@ namespace RC::Combine::Manager
 			}
 
 			// Hide what the chunks now draw: a reference whose every part was combined is hidden at its root (the
-			// scene walk skips it), others mesh by mesh.
-			const auto hide = [&](RE::NiAVObject* a_object, const SourceRef& a_ref, bool a_root) {
-				a_object->SetAppCulled(true);
+			// scene walk skips it), others mesh by mesh. A root that owns a collision object stays unculled and its
+			// meshes are hidden instead, though it still counts as hidden whole (parked, out of previs): the camera's
+			// collision cast ignores a body whose owner is AppCulled (FO4-ENGINE-NOTES 7.14). Gather keeps meshes
+			// with collision visible, so a root is the only owner this could cull.
+			const auto hide = [&](RE::NiAVObject* a_object, const SourceRef& a_ref, bool a_root, bool a_cull) {
+				if (a_cull) {
+					a_object->SetAppCulled(true);
+				}
 				auto& hidden = applied->hidden.emplace_back();
+				hidden.culled = a_cull;
 				hidden.object.reset(a_object);
 				hidden.ref = a_ref.ref;
 				hidden.root = a_ref.root;
@@ -1074,22 +1081,24 @@ namespace RC::Combine::Manager
 				g_ours.insert(a_object);
 				g_hiddenRefs[a_ref.formID] = a_job.cell;
 			};
-			std::vector<bool>            wholeHidden(a_job.refs.size(), false);
+			std::vector<bool>            rootCulled(a_job.refs.size(), false);
 			std::vector<RE::NiAVObject*> roots;
 			for (std::size_t i = 0; i < a_job.refs.size(); ++i) {
 				const auto& ref = a_job.refs[i];
 				if (ref.baked && ref.whole && ref.baked == ref.captured) {
-					hide(ref.root.get(), ref, true);
+					const bool solid = ref.root->collisionObject != nullptr;
+					hide(ref.root.get(), ref, true, !solid);
 					roots.push_back(ref.root.get());
-					wholeHidden[i] = true;
+					rootCulled[i] = !solid;
 					++stats.wholeRefs;
+					stats.solidRefs += solid;
 				} else if (ref.baked) {
 					++stats.partialRefs;
 				}
 			}
 			for (const auto& shape : a_job.shapes) {
-				if (shape.baked && !wholeHidden[shape.ref]) {
-					hide(shape.shape.get(), a_job.refs[shape.ref], false);
+				if (shape.baked && !rootCulled[shape.ref]) {
+					hide(shape.shape.get(), a_job.refs[shape.ref], false, true);
 				}
 			}
 
@@ -1254,7 +1263,7 @@ namespace RC::Combine::Manager
 				return Check::kStale;
 			}
 			const auto object = a_hidden.object.get();
-			if (!object->GetAppCulled() || !object->parent || !(World(object->world) == a_hidden.world)) {
+			if ((a_hidden.culled && !object->GetAppCulled()) || !object->parent || !(World(object->world) == a_hidden.world)) {
 				return Check::kStale;
 			}
 			if (a_hidden.children != kNoChildCount) {

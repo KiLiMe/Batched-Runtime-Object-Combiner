@@ -88,6 +88,7 @@ namespace RC::Combine
 		std::uint32_t vertices{ 0 };
 		std::uint64_t vertexBytes{ 0 };      // their vertex data
 		std::uint32_t wholeRefs{ 0 };        // references hidden whole (the scene walk skips them)
+		std::uint32_t solidRefs{ 0 };        // of them, roots that own collision: left unculled, meshes hidden
 		std::uint32_t partialRefs{ 0 };      // references with only some meshes hidden
 		double        gatherMs{ 0.0 };
 		double        bakeMs{ 0.0 };
