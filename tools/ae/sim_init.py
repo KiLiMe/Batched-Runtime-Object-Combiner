@@ -152,7 +152,9 @@ ANY_OF = ["precombines"]
 # constructor instead (the vtable slots and class layouts are the same on every runtime):
 #   update  - NiAVObject::Update is inlined everywhere; UpdateStatic calls the virtual passes
 #             UpdateDownwardPass (slot 0x30) and UpdateUpwardPass (slot 0x42) directly.
-NO_ID_NEEDED = ["update"]
+#   nodes   - both SDKs leave BSFadeNode's default constructor, which is NiNode(0) plus the class
+#             vtable; NewNode/AllocFadeNode build that themselves when the constructor ids are absent.
+NO_ID_NEEDED = ["update", "nodes"]
 
 
 def main():

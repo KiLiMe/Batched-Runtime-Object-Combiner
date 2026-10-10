@@ -475,9 +475,47 @@ namespace RC::Engine
 		return static_cast<float>(uGrids + 1) * 2048.0F * 1.4142F;
 	}
 
+	namespace
+	{
+		// BSFadeNode has no constructor of its own in either SDK: both leave the default one, which is
+		// NiNode(0) plus the class vtable plus its tail members. That is everything NewChunkFadeNode builds,
+		// so on a runtime without the engine constructor id the object is assembled here instead.
+		//
+		// The tail (0x140..0x1C0: lightData, geomArray, mergedGeomBounds and the fade floats) starts zeroed,
+		// which is what a default-constructed BSFadeNode looks like before Init/callers set anything. The
+		// stack of BSTArray members are all empty (null data, zero counts), so nothing owns memory yet and
+		// nothing needs the element types to be complete.
+		[[nodiscard]] RE::NiNode* AllocFadeNode()
+		{
+			if (g.fadeNodeCtor) {
+				auto memory = RE::aligned_alloc(0x10, sizeof(RE::BSFadeNode));  // 0x1C0 bytes, 16-aligned
+				if (!memory) {
+					return nullptr;
+				}
+				std::memset(memory, 0, sizeof(RE::BSFadeNode));
+				using ctor_t = RE::BSFadeNode* (*)(void*);
+				return reinterpret_cast<ctor_t>(g.fadeNodeCtor)(memory);
+			}
+
+			// No engine constructor: build the NiNode base, then swap in the BSFadeNode vtable over the same
+			// zeroed tail. sizeof(NiNode) is 0x140 and the vtable pointer sits at offset 0, so the two layouts
+			// share the head; everything past 0x140 is the fade tail.
+			constexpr std::size_t kFadeNodeSize = 0x1C0;
+			auto                  memory = RE::aligned_alloc(0x10, kFadeNodeSize);
+			if (!memory) {
+				return nullptr;
+			}
+			std::memset(memory, 0, kFadeNodeSize);
+			const auto node = new (memory) RE::NiNode(0);
+			*reinterpret_cast<std::uintptr_t*>(node) = g.fadeNodeVtable;  // BSFadeNode rather than NiNode
+			return node;
+		}
+	}
+
 	RE::BSFadeNode* NewChunkFadeNode(RE::NiAVObject* a_shape, float a_fade, const FadeRange& a_range)
 	{
-		static_assert(sizeof(RE::BSFadeNode) == 0x1C0);
+		// 0x1C0 is the size both SDKs assert. It is spelled out rather than taken from the class so this
+		// translation unit never instantiates BSFadeNode (see AllocFadeNode).
 		const auto uGrids = *reinterpret_cast<const std::int32_t*>(g.uGrids);
 		if (!a_range.Valid() && (uGrids < 1 || uGrids > 63)) {
 			static bool logged = false;
@@ -486,15 +524,12 @@ namespace RC::Engine
 			}
 			return nullptr;
 		}
-		auto memory = RE::aligned_alloc(0x10, sizeof(RE::BSFadeNode));  // as ProcessTriShape: 0x1C0 bytes, 16-aligned
-		if (!memory) {
+		// Assembly differs by runtime: the engine constructor on OG, a NiNode head plus the fade tail elsewhere.
+		const auto node = static_cast<RE::BSFadeNode*>(static_cast<void*>(AllocFadeNode()));
+		if (!node) {
 			return nullptr;
 		}
-		std::memset(memory, 0, sizeof(RE::BSFadeNode));
-		using ctor_t = RE::BSFadeNode* (*)(void*);
-		const auto node = reinterpret_cast<ctor_t>(g.fadeNodeCtor)(memory);
 		node->local.MakeIdentity();
-
 		if (a_range.Valid()) {
 			// The members' own range and type: the chunk fades out where they would (7.9).
 			*Field<std::uint8_t>(node, Offset::kFadeType) = a_range.type;
@@ -534,13 +569,11 @@ namespace RC::Engine
 
 	RE::BSFadeNode* NewProbe()
 	{
-		auto memory = RE::aligned_alloc(0x10, sizeof(RE::BSFadeNode));
-		if (!memory) {
+		// Same assembly choice as NewChunkFadeNode; see AllocFadeNode.
+		const auto node = static_cast<RE::BSFadeNode*>(static_cast<void*>(AllocFadeNode()));
+		if (!node) {
 			return nullptr;
 		}
-		std::memset(memory, 0, sizeof(RE::BSFadeNode));
-		using ctor_t = RE::BSFadeNode* (*)(void*);
-		const auto node = reinterpret_cast<ctor_t>(g.fadeNodeCtor)(memory);
 		node->local.MakeIdentity();
 		node->name = RE::BSFixedString("RuntimeCombiner probe");
 		// Init leaves near and far at FLT_MAX, so ComputeFadeAmount returns 1 at any distance (7.9).
