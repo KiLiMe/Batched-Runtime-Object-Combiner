@@ -20,10 +20,8 @@ namespace RC::Engine
 		constexpr std::uint64_t kNodeCtorID = 20633;           // NiNode::NiNode(uint)                 0x141B98920
 		constexpr std::uint64_t kFadeNodeCtorID = 668955;      // BSFadeNode::BSFadeNode()             0x1427D04C0
 		constexpr std::uint64_t kFadeRangeID = 1417061;        // ConfigureFadeNodeRange(BSFadeNode*, float uGrids, bool) 0x1401CFAC0
-		constexpr std::uint64_t kUGridsToLoadID = 504589;      // uGridsToLoad:General value (int)     0x1436D9B50
 		constexpr std::uint64_t kFadeFrameID = 734919;         // the fade code's frame number (int)   0x1438C4E6C
 		constexpr std::uint64_t kUpdateID = 121052;            // NiAVObject::Update(NiUpdateData&)    0x141BA3BE0
-		constexpr std::uint64_t kUseCombinedID = 267057;       // bUseCombinedObjects:General value    0x1436E9C00
 		constexpr std::uint64_t kPrevisEnabledID = 652211;     // BSPreCulledObjects::QWantEnabled          0x142809E60
 		constexpr std::uint64_t kPrevisActiveID = 917969;      // BSPreCulledObjects::QEnabled             0x142809E30
 		constexpr std::uint64_t kSetRangeID = 1164193;         // BSFadeNode::SetRange(near, far)          0x1427D1CF0
@@ -48,6 +46,12 @@ namespace RC::Engine
 		// Runtime Database for 1.11.240 by tools/ae/sim_init.py.
 		constexpr REL::ID kTES{ 1194835, 2698044 };  // TES* singleton: RE::ID::TES::Singleton
 		constexpr REL::ID kGridGet{ 1330136, 2194566 };  // GridCellArray::Get(x, y): RE::ID::GridCellArray::Get
+		// These two keep the *same* number in the 1.10.163 and the 1.11.x Address Library, so one id serves
+		// both families. For 1.11.240 the number was checked three ways: it is present in version-1-11-240-0.bin,
+		// the Runtime Database maps it to the same RVA, and the executable really holds the expected value there
+		// (uGridsToLoad reads 5, bUseCombinedObjects reads 1).
+		constexpr REL::ID kUGrids{ 504589, 504589 };      // uGridsToLoad:General (int), 0x2EDD680 on AE
+		constexpr REL::ID kUseCombined{ 267057, 267057 };  // bUseCombinedObjects:General (bool), 0x2EE42C8 on AE
 
 		// TES and the exterior cell grid (layouts from CBRO's Compat.h).
 		struct GridCellArray
@@ -201,12 +205,12 @@ namespace RC::Engine
 		g.nodeCtor = Ask(kNodeCtorID, "NiNode::NiNode");
 		g.fadeNodeCtor = Ask(kFadeNodeCtorID, "BSFadeNode::BSFadeNode");
 		g.fadeRange = Ask(kFadeRangeID, "ConfigureFadeNodeRange");
-		g.uGrids = Ask(kUGridsToLoadID, "uGridsToLoad");
+		g.uGrids = Ask(kUGrids, "uGridsToLoad");
 		g.fadeFrame = Ask(kFadeFrameID, "fade frame number");
 		g.update = Ask(kUpdateID, "NiAVObject::Update");
 		g.tes = Ask(kTES, "TES");
 		g.gridGet = Ask(kGridGet, "GridCellArray::Get");
-		g.useCombined = Ask(kUseCombinedID, "bUseCombinedObjects");
+		g.useCombined = Ask(kUseCombined, "bUseCombinedObjects");
 		// The GameSettingCollection path for the same switch: the id resolves on every family, so on AE this
 		// is what makes caps.precombines true. Probe it non-fatally; a missing singleton just leaves it false.
 		g.settingCollection = ProbeSettingCollection();

@@ -40,8 +40,7 @@ Offline (this script) and on a live start (2026-10-11, log path below) agree:
                            GameSettingCollection::Singleton
     CombineReady() == false -> Plugin.cpp logs and installs nothing
 
-The live log (D:\UserData\F4SE_log\RuntimeCombiner.log on the porting machine)
-reads:
+The live log (on the porting machine it lands in the F4SE log directory) reads:
 
     Runtime Combiner v0.3.1 loading: game 1-11-240-0, F4SE 0-7-9-0
     settings (RuntimeCombiner.ini): enabled true, ...
@@ -112,12 +111,12 @@ ENGINE_IDS = [
     ("NiNode::NiNode",                 (20633,    INVALID_ID), "nodes"),
     ("BSFadeNode::BSFadeNode",         (668955,   INVALID_ID), "nodes"),
     ("ConfigureFadeNodeRange",         (1417061,  INVALID_ID), "fade"),
-    ("uGridsToLoad",                   (504589,   INVALID_ID), "fade"),
+    ("uGridsToLoad",                   (504589,   504589),    "fade"),
     ("fade frame number",              (734919,   INVALID_ID), "fade"),
     ("NiAVObject::Update",             (121052,   INVALID_ID), "update"),
     ("TES",                            (1194835,  2698044),   "cells"),
     ("GridCellArray::Get",             (1330136,  2194566),   "cells"),
-    ("bUseCombinedObjects",            (267057,   INVALID_ID), "precombines"),
+    ("bUseCombinedObjects",            (267057,   267057),    "precombines"),
     # The GameSettingCollection fallback for the same switch: RE::GameSettingCollection::GetSingleton()
     # (declared in the SDK as REL::ID(8308, 4797590)). It resolves on every family, so caps.precombines
     # is true on AE even though the OG global's id is not.
