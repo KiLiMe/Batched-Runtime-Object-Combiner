@@ -2,6 +2,16 @@
   "version": 3,
   "configurePresets": [
     {
+      "name": "vs",
+      "displayName": "Visual Studio 2022 x64 (local, no ninja needed)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs",
+      "cacheVariables": {
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/build/vcpkg_installed"
+      }
+    },
+    {
       "name": "release",
       "displayName": "Ninja release (with debug info)",
       "generator": "Ninja",
@@ -23,6 +33,7 @@
     }
   ],
   "buildPresets": [
+    { "name": "vs", "configurePreset": "vs", "configuration": "Release" },
     { "name": "release", "configurePreset": "release" },
     { "name": "debug", "configurePreset": "debug" }
   ]

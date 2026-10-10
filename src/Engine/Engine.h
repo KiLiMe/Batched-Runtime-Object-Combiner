@@ -1,16 +1,13 @@
 #pragma once
 
-// Engine access for Fallout 4 OG 1.10.163. Every id, offset and function here was read from the executable on
-// 2026-10-02 (CBRO's FO4-ENGINE-NOTES.md 7.2, 7.4, 7.5 record the facts and their sources). Ids are OG-only:
-// they resolve on 1.10.163 and fail safely (unknown id) elsewhere, so the plugin installs nothing there.
+// Engine access for Fallout 4. The ids below were read from the 1.10.163 (OG) executable on 2026-10-02
+// (CBRO's FO4-ENGINE-NOTES.md 7.2, 7.4, 7.5 record the facts and their sources) and are declared as OG-only:
+// REL::ID{ og, INVALID_ID } asks for the OG slot and reports no id for any other runtime. Engine::Init()
+// looks each one up without failing, so on a runtime that does not carry them (the AE family) the plugin
+// keeps loading with CombineReady() == false instead of stopping the game with an id error.
 
 namespace RC::Engine
 {
-	[[nodiscard]] constexpr REL::ID OG(std::uint64_t a_og) noexcept
-	{
-		return REL::ID{ a_og, REL::ID::INVALID_ID };
-	}
-
 	namespace Offset
 	{
 		// NiObjectNET
@@ -89,8 +86,37 @@ namespace RC::Engine
 		return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(a_base) + a_offset);
 	}
 
-	// Resolves every address once (Plugin load). False when one is missing: install nothing.
-	[[nodiscard]] bool Init();
+	// What the running executable gave us. Every field is filled by Init(); a plugin must check before using
+	// an engine function. On a runtime whose layouts/ids are not verified, most of these stay false and the
+	// combining feature is left off (the plugin still loads, reads its ini and logs).
+	struct Capabilities
+	{
+		bool clone{ false };              // combine: build a mesh copy
+		bool triShape{ false };           // combine: create / release renderer geometry
+		bool geometry{ false };           // combine: replace a shape's renderer data
+		bool nodes{ false };              // combine: node / fade-node factories
+		bool update{ false };             // combine: place and settle a subtree
+		bool fade{ false };               // combine: distance fade (range, multipliers, frame number)
+		bool previs{ false };             // combine: read the previs state and register dynamic objects
+		bool previsHook{ false };         // combine: wrap the per-frame previs query
+		bool resetHook{ false };          // combine: wrap the cell purge after a save load
+		bool precombines{ false };        // [General] bDisablePrecombines: the bUseCombinedObjects switch
+		bool cells{ false };              // combine: enumerate loaded cells
+
+		// Every capability the combining feature needs. False on an unverified runtime, so nothing is
+		// installed and the scene is left exactly as the engine built it.
+		[[nodiscard]] bool CombineReady() const noexcept
+		{
+			return clone && triShape && geometry && nodes && update && fade && cells;
+		}
+	};
+
+	// Resolves what the running executable offers (Plugin load). Never fatal: a runtime whose ids or layouts
+	// are not verified simply reports fewer capabilities. CombineReady() says whether combining may run.
+	[[nodiscard]] const Capabilities& Init();
+
+	// The capabilities Init() found (valid after Init()).
+	[[nodiscard]] const Capabilities& Caps() noexcept;
 
 	// Exact-class tests (never subclasses).
 	[[nodiscard]] bool IsExactTriShape(const RE::NiAVObject* a_object) noexcept;
@@ -175,6 +201,9 @@ namespace RC::Engine
 	[[nodiscard]] bool                            InInterior() noexcept;  // TES's interior cell is set (portal culling)
 
 	// The engine's precombine switch ([General] bUseCombinedObjects), read at every cell load.
+	// Two ways to reach it: the global the OG executable keeps (when that address resolved) or, on a
+	// runtime that has no id for the global, the engine's own GameSettingCollection entry of the same name
+	// (RE::GameSettingCollection::GetSingleton(), an id the Runtime Database carries for every family).
 	[[nodiscard]] bool PrecombinesEnabled() noexcept;
 	// The cell's precombined references (extra 0xC5, ExtraCombinedRefs, built from its XCRI record whatever the
 	// precombine switch says; FO4-ENGINE-NOTES 7.12), or null. Main thread.

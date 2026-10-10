@@ -6,7 +6,12 @@ namespace RC::Engine
 {
 	namespace
 	{
-		// Ids (OG 1.10.163), addresses as resolved there.
+		// Ids. Every one is declared with the runtime families that carry it:
+		//   REL::ID{ og, ae }            - this codebase's two-slot form (NG shares the AE value)
+		//   REL::ID{ og, INVALID_ID }    - OG only: the AE family has no id for it yet (see tools/ae/README.md)
+		// Ids still marked OG-only were read from the 1.10.163 executable; the AE ones come from the AE-only
+		// CommonLibF4 (D:\Sou\Fallout_4\CommonLibF4) and each was checked against the Runtime Database with
+		// tools/ae/rd_probe.py before being filled in here.
 		constexpr std::uint64_t kCloneID = 604942;             // NiObject::Clone(void)                 0x141B94B00
 		constexpr std::uint64_t kCreateTriShapeID = 99624;     // Renderer::CreateTriShape(uint&, void*, u64, u16*, uint) 0x141D0BC70
 		constexpr std::uint64_t kDecRefTriShapeID = 1039714;   // Renderer::DecRef(TriShape*)          0x141D0C5D0
@@ -25,7 +30,6 @@ namespace RC::Engine
 		constexpr std::uint64_t kFadeMultsID = 804710;         // float[]: fade-out multiplier per LOD-mult type 0x1438C4E18
 		constexpr std::uint64_t kFadeDistMultID = 515159;      // float: fDistanceMultiplier:LOD           0x1438C4E64
 		constexpr std::uint64_t kFadingOnID = 1220201;         // byte: fading enabled                     0x1438C4E44
-		constexpr std::uint64_t kTESID = 1194835;              // TES* singleton
 		// The previs query and its dynamic objects (FO4-ENGINE-NOTES 5.5b, 5.5d).
 		constexpr std::uint64_t kRenderPreUIID = 984743;       // DrawWorld::Render_PreUI                  0x142857480
 		constexpr std::size_t   kPrevisQuerySite = 0x80;       //   call 1264353 (E8 rel32)
@@ -33,13 +37,17 @@ namespace RC::Engine
 		constexpr std::uint64_t kVisibilityID = 787073;        // MultiCellVisibilityData* (global)        0x1458D0AA8
 		constexpr std::uint64_t kRegisterDynamicID = 272586;   // MultiCellVisibilityData::RegisterDynamicObject   0x1427AF460
 		constexpr std::uint64_t kUnregisterDynamicID = 697930; // MultiCellVisibilityData::UnregisterDynamicObject 0x1427AF590
-		constexpr std::uint64_t kGridGetID = 1330136;          // GridCellArray::Get(x, y)
 		constexpr std::uint32_t kCombinedRefsExtra = 0xC5;     // ExtraCombinedRefs (vtable 130663)
 		// A save load clears every cell, then purges the cell buffer (FO4-ENGINE-NOTES 7.12).
 		constexpr std::uint64_t kGameResetID = 124452;         // Main::PerformGameReset                   0x140D3B800
 		constexpr std::size_t   kGameResetPurgeSite = 0x2ED;   //   call 1075115 (E8 rel32), after TES::ClearAllCells
 		constexpr std::uint64_t kPurgeCellsID = 1075115;       // TES::PurgeBufferedCells                  0x1400F70A0
 		constexpr std::size_t   kCanMergeSlot = 0x31;          // BSShaderProperty::CanMerge(BSShaderProperty*)
+
+		// Ids with an AE slot. Sourced from the AE-only CommonLibF4 (RE::ID::...) and verified against the
+		// Runtime Database for 1.11.240 by tools/ae/sim_init.py.
+		constexpr REL::ID kTES{ 1194835, 2698044 };  // TES* singleton: RE::ID::TES::Singleton
+		constexpr REL::ID kGridGet{ 1330136, 2194566 };  // GridCellArray::Get(x, y): RE::ID::GridCellArray::Get
 
 		// TES and the exterior cell grid (layouts from CBRO's Compat.h).
 		struct GridCellArray
@@ -74,6 +82,7 @@ namespace RC::Engine
 			std::uintptr_t tes{ 0 };
 			std::uintptr_t gridGet{ 0 };
 			std::uintptr_t useCombined{ 0 };
+			bool           settingCollection{ false };  // the GameSettingCollection singleton resolved
 			std::uintptr_t previsEnabled{ 0 };
 			std::uintptr_t previsActive{ 0 };
 			std::uintptr_t setRange{ 0 };
@@ -94,25 +103,83 @@ namespace RC::Engine
 			std::uintptr_t effectShaderVtable{ 0 };
 		};
 		Addresses g;
+		Capabilities g_caps;
 
-		std::uintptr_t Resolve(std::uint64_t a_id, const char* a_name, bool& a_ok)
+		// Ids Init() could not resolve, in the order they were asked for. Reported as one line so a runtime
+		// that carries none of them (the AE family) does not flood the log with one warning per id.
+		std::vector<const char*> g_missing;
+
+		// Looks an id up without ever failing the process: REL::ID::address() calls report_and_fail (a fatal
+		// error box) when the id does not resolve, which is exactly what happens on a runtime whose slot for
+		// this id is not in the database. On such a runtime the id is simply reported as absent, so the
+		// plugin can carry on with fewer capabilities. A miss is recorded, not logged.
+		[[nodiscard]] std::uintptr_t Lookup(const REL::ID& a_id, const char* a_name)
 		{
-			const auto address = OG(a_id).address();
-			if (!address) {
-				logger::error("engine id {} ({}) did not resolve", a_id, a_name);
-				a_ok = false;
+			const auto& version = REL::Module::get().version();
+			if (a_id.id(version) == REL::ID::INVALID_ID) {
+				g_missing.push_back(a_name);
+				return 0;
 			}
-			return address;
+			const auto result = REL::IDDatabase::get().resolve(a_id);
+			if (!result.rva) {
+				logger::warn("engine id {} ({}) did not resolve: {}", a_id.id(version), a_name, REL::id_resolve_status_text(result.status));
+				g_missing.push_back(a_name);
+				return 0;
+			}
+			return REL::Module::get().base() + *result.rva;
 		}
 
-		std::uintptr_t VtableOf(std::span<const REL::ID> a_ids, const char* a_name, bool& a_ok)
+		// The raw read, kept free of any object that needs unwinding so __try is allowed (C2712).
+		[[nodiscard]] bool ReadSettingCollectionPresent() noexcept
 		{
-			const auto address = a_ids.empty() ? 0 : a_ids[0].address();
-			if (!address) {
-				logger::error("vtable of {} did not resolve", a_name);
-				a_ok = false;
+			__try {
+				return RE::GameSettingCollection::GetSingleton() != nullptr;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
 			}
-			return address;
+		}
+
+		// Whether the GameSettingCollection singleton can actually be reached. This is the one probe that has
+		// to run code, not just resolve an id, so it is guarded: the singleton pointer is read only after the
+		// id resolved, and any fault leaves the capability off rather than taking the process down. Whether
+		// bUseCombinedObjects itself is present is settled by the first read or write, which logs when not.
+		[[nodiscard]] bool ProbeSettingCollection()
+		{
+			// The SDK declares the singleton as REL::ID(8308, 4797590); ask the database for the running
+			// family's slot the same non-fatal way Lookup() does.
+			constexpr REL::ID kSingleton{ 8308, 4797590 };
+			const auto&       version = REL::Module::get().version();
+			if (kSingleton.id(version) == REL::ID::INVALID_ID) {
+				return false;
+			}
+			if (!REL::IDDatabase::get().resolve(kSingleton).rva) {
+				return false;
+			}
+			const bool present = ReadSettingCollectionPresent();
+			if (!present) {
+				logger::warn("the GameSettingCollection singleton could not be read: the precombine switch is unavailable");
+			}
+			return present;
+		}
+
+		[[nodiscard]] std::uintptr_t Ask(std::uint64_t a_id, const char* a_name)
+		{
+			return Lookup(REL::ID{ a_id, REL::ID::INVALID_ID }, a_name);
+		}
+
+		// For ids that already carry an AE slot (REL::ID{og, ae}).
+		[[nodiscard]] std::uintptr_t Ask(const REL::ID& a_id, const char* a_name)
+		{
+			return Lookup(a_id, a_name);
+		}
+
+		[[nodiscard]] std::uintptr_t AskVtable(std::span<const REL::ID> a_ids, const char* a_name)
+		{
+			if (a_ids.empty()) {
+				g_missing.push_back(a_name);
+				return 0;
+			}
+			return Lookup(a_ids[0], a_name);
 		}
 
 		[[nodiscard]] std::uintptr_t VtableOfObject(const void* a_object) noexcept
@@ -121,45 +188,88 @@ namespace RC::Engine
 		}
 	}
 
-	bool Init()
+	const Capabilities& Init()
 	{
-		bool ok = true;
-		g.clone = Resolve(kCloneID, "NiObject::Clone", ok);
-		g.createTriShape = Resolve(kCreateTriShapeID, "Renderer::CreateTriShape", ok);
-		g.decRefTriShape = Resolve(kDecRefTriShapeID, "Renderer::DecRef(TriShape)", ok);
-		g.renderer = Resolve(kRendererID, "Renderer", ok);
-		g.setRendererData = Resolve(kSetRendererDataID, "BSGeometry::SetRendererData", ok);
-		g.nodeCtor = Resolve(kNodeCtorID, "NiNode::NiNode", ok);
-		g.fadeNodeCtor = Resolve(kFadeNodeCtorID, "BSFadeNode::BSFadeNode", ok);
-		g.fadeRange = Resolve(kFadeRangeID, "ConfigureFadeNodeRange", ok);
-		g.uGrids = Resolve(kUGridsToLoadID, "uGridsToLoad", ok);
-		g.fadeFrame = Resolve(kFadeFrameID, "fade frame number", ok);
-		g.update = Resolve(kUpdateID, "NiAVObject::Update", ok);
-		g.tes = Resolve(kTESID, "TES", ok);
-		g.gridGet = Resolve(kGridGetID, "GridCellArray::Get", ok);
-		g.useCombined = Resolve(kUseCombinedID, "bUseCombinedObjects", ok);
-		g.previsEnabled = Resolve(kPrevisEnabledID, "previs query", ok);
-		g.previsActive = Resolve(kPrevisActiveID, "previs active query", ok);
-		g.setRange = Resolve(kSetRangeID, "BSFadeNode::SetRange", ok);
-		g.fadeMults = Resolve(kFadeMultsID, "fade multipliers", ok);
-		g.fadeDistMult = Resolve(kFadeDistMultID, "fDistanceMultiplier", ok);
-		g.fadingOn = Resolve(kFadingOnID, "fading enabled", ok);
+		// One id at a time, no all-or-nothing gate: a runtime whose ids are not in the database simply
+		// reports fewer capabilities, and the plugin decides what it can do. Addresses of functions that
+		// do resolve are still published, so a later port only has to fill in the missing ones.
+		g.clone = Ask(kCloneID, "NiObject::Clone");
+		g.createTriShape = Ask(kCreateTriShapeID, "Renderer::CreateTriShape");
+		g.decRefTriShape = Ask(kDecRefTriShapeID, "Renderer::DecRef(TriShape)");
+		g.renderer = Ask(kRendererID, "Renderer");
+		g.setRendererData = Ask(kSetRendererDataID, "BSGeometry::SetRendererData");
+		g.nodeCtor = Ask(kNodeCtorID, "NiNode::NiNode");
+		g.fadeNodeCtor = Ask(kFadeNodeCtorID, "BSFadeNode::BSFadeNode");
+		g.fadeRange = Ask(kFadeRangeID, "ConfigureFadeNodeRange");
+		g.uGrids = Ask(kUGridsToLoadID, "uGridsToLoad");
+		g.fadeFrame = Ask(kFadeFrameID, "fade frame number");
+		g.update = Ask(kUpdateID, "NiAVObject::Update");
+		g.tes = Ask(kTES, "TES");
+		g.gridGet = Ask(kGridGet, "GridCellArray::Get");
+		g.useCombined = Ask(kUseCombinedID, "bUseCombinedObjects");
+		// The GameSettingCollection path for the same switch: the id resolves on every family, so on AE this
+		// is what makes caps.precombines true. Probe it non-fatally; a missing singleton just leaves it false.
+		g.settingCollection = ProbeSettingCollection();
+		g.previsEnabled = Ask(kPrevisEnabledID, "previs query");
+		g.previsActive = Ask(kPrevisActiveID, "previs active query");
+		g.setRange = Ask(kSetRangeID, "BSFadeNode::SetRange");
+		g.fadeMults = Ask(kFadeMultsID, "fade multipliers");
+		g.fadeDistMult = Ask(kFadeDistMultID, "fDistanceMultiplier");
+		g.fadingOn = Ask(kFadingOnID, "fading enabled");
 		// Optional: without them chunks are not drawn while previs draws the main view (the originals are shown then).
-		bool feed = true;
-		const auto renderPreUI = Resolve(kRenderPreUIID, "Render_PreUI", feed);
+		const auto renderPreUI = Ask(kRenderPreUIID, "Render_PreUI");
 		g.previsQuerySite = renderPreUI ? renderPreUI + kPrevisQuerySite : 0;
-		g.previsQuery = Resolve(kPrevisQueryID, "previs query", feed);
-		g.visibility = Resolve(kVisibilityID, "MultiCellVisibilityData", feed);
-		g.registerDynamic = Resolve(kRegisterDynamicID, "RegisterDynamicObject", feed);
-		g.unregisterDynamic = Resolve(kUnregisterDynamicID, "UnregisterDynamicObject", feed);
-		g.previsFeed = feed;
-		g.triShapeVtable = VtableOf(RE::VTABLE::BSTriShape, "BSTriShape", ok);
-		g.meshLODTriShapeVtable = VtableOf(RE::VTABLE::BSMeshLODTriShape, "BSMeshLODTriShape", ok);
-		g.nodeVtable = VtableOf(RE::VTABLE::NiNode, "NiNode", ok);
-		g.fadeNodeVtable = VtableOf(RE::VTABLE::BSFadeNode, "BSFadeNode", ok);
-		g.lightingShaderVtable = VtableOf(RE::VTABLE::BSLightingShaderProperty, "BSLightingShaderProperty", ok);
-		g.effectShaderVtable = VtableOf(RE::VTABLE::BSEffectShaderProperty, "BSEffectShaderProperty", ok);
-		return ok;
+		g.previsQuery = Ask(kPrevisQueryID, "previs query");
+		g.visibility = Ask(kVisibilityID, "MultiCellVisibilityData");
+		g.registerDynamic = Ask(kRegisterDynamicID, "RegisterDynamicObject");
+		g.unregisterDynamic = Ask(kUnregisterDynamicID, "UnregisterDynamicObject");
+		g.previsFeed = g.previsQuerySite && g.previsQuery && g.visibility && g.registerDynamic && g.unregisterDynamic;
+		g.triShapeVtable = AskVtable(RE::VTABLE::BSTriShape, "BSTriShape");
+		g.meshLODTriShapeVtable = AskVtable(RE::VTABLE::BSMeshLODTriShape, "BSMeshLODTriShape");
+		g.nodeVtable = AskVtable(RE::VTABLE::NiNode, "NiNode");
+		g.fadeNodeVtable = AskVtable(RE::VTABLE::BSFadeNode, "BSFadeNode");
+		g.lightingShaderVtable = AskVtable(RE::VTABLE::BSLightingShaderProperty, "BSLightingShaderProperty");
+		g.effectShaderVtable = AskVtable(RE::VTABLE::BSEffectShaderProperty, "BSEffectShaderProperty");
+
+		g_caps.clone = g.clone != 0;
+		g_caps.triShape = g.createTriShape && g.decRefTriShape && g.renderer && g.triShapeVtable && g.meshLODTriShapeVtable;
+		g_caps.geometry = g.setRendererData != 0;
+		g_caps.nodes = g.nodeVtable && g.fadeNodeVtable;  // NewNode/NewChunkFadeNode fall back to the SDK constructors
+		g_caps.update = true;  // the virtual passes are always there (Engine::UpdateStatic falls back to them)
+		g_caps.fade = g.fadeRange && g.uGrids && g.fadeFrame && g.setRange && g.fadeMults && g.fadeDistMult && g.fadingOn;
+		g_caps.previs = g.previsEnabled && g.previsActive;
+		g_caps.previsHook = g.previsFeed;
+		g_caps.resetHook = true;  // the site check below decides; the ids are asked there
+		g_caps.precombines = g.useCombined != 0 || g.settingCollection;
+		g_caps.cells = g.tes && g.gridGet != 0;
+
+		// One compact summary instead of one warning per id: on a runtime that carries none of these ids that
+		// would otherwise be ~25 lines per start. The names are listed so a port knows exactly what to fill in.
+		if (!g_missing.empty()) {
+			std::string names;
+			for (const auto* name : g_missing) {
+				if (!names.empty()) {
+					names += ", ";
+				}
+				names += name;
+			}
+			logger::warn(
+				"{} engine ids are missing on {} (not in the Runtime Database for this runtime): {}",
+				g_missing.size(), REL::Module::get().version().string(), names);
+		}
+
+		logger::info(
+			"engine ids: combine {}, previs {}, precombines {} -> combining {}",
+			g_caps.CombineReady() ? "ready" : "incomplete",
+			g_caps.previs ? "available" : "missing",
+			g_caps.precombines ? "available" : "missing",
+			g_caps.CombineReady() ? "enabled" : "disabled");
+		return g_caps;
+	}
+
+	const Capabilities& Caps() noexcept
+	{
+		return g_caps;
 	}
 
 	bool IsExactTriShape(const RE::NiAVObject* a_object) noexcept
@@ -267,16 +377,50 @@ namespace RC::Engine
 		}
 	}
 
+	namespace
+	{
+		// The engine's own NiAVObject::Update(NiUpdateData&) is inlined in every SDK build: it runs
+		// UpdateDownwardPass(data, 0) and, when the object has a parent and the data does not carry
+		// flag 0x200, parent->UpdateUpwardPass(data). Both are virtual, at slots 0x30 and 0x42, so they
+		// can be called through the object's own vtable on any runtime - no engine id is needed for this.
+		constexpr std::size_t kUpdateDownwardSlot = 0x30;
+		constexpr std::size_t kUpdateUpwardSlot = 0x42;
+		constexpr std::uint32_t kUpdateNoUpward = 0x200;  // NiAVObject::Update skips the upward pass
+	}
+
 	void UpdateStatic(RE::NiAVObject* a_object)
 	{
 		RE::NiUpdateData data{};
-		using func_t = void (*)(RE::NiAVObject*, RE::NiUpdateData&);
-		reinterpret_cast<func_t>(g.update)(a_object, data);
+		if (g.update) {
+			// OG: the free function the ids know. Kept so 1.10.163 behaves exactly as before.
+			using func_t = void (*)(RE::NiAVObject*, RE::NiUpdateData&);
+			reinterpret_cast<func_t>(g.update)(a_object, data);
+		} else {
+			// Any runtime: the two virtual passes the same function performs. The parent is read at
+			// NiAVObject::parent (+0x28: NiObjectNET is 0x28 bytes). Reading it as a pointer rather than
+			// through the SDK field keeps this translation unit from needing the full NiAVObject type.
+			using pass_t = void (*)(RE::NiAVObject*, RE::NiUpdateData&, std::uint32_t);
+			using upward_t = void (*)(void*, RE::NiUpdateData&);
+			constexpr std::size_t kObjectParent = 0x28;
+			// The object's own vtable, read once: slots 0x30 (downward) and 0x42 (upward).
+			const auto slots = *reinterpret_cast<void* const* const*>(a_object);
+			reinterpret_cast<pass_t>(slots[kUpdateDownwardSlot])(a_object, data, 0);
+			const auto parent = *Field<void* const>(a_object, kObjectParent);
+			if (parent && (data.flags & kUpdateNoUpward) == 0) {
+				const auto parentSlots = *reinterpret_cast<void* const* const*>(parent);
+				reinterpret_cast<upward_t>(parentSlots[kUpdateUpwardSlot])(parent, data);
+			}
+		}
 		SettlePreviousWorld(a_object);
 	}
 
 	RE::NiNode* NewNode(std::uint16_t a_children)
 	{
+		if (!g.nodeCtor) {
+			// Any runtime: the SDK's NiNode constructor is inline (it sizes the children array and sets
+			// the child vtable through stl::emplace_vtable), so no engine id is needed.
+			return new RE::NiNode(a_children);
+		}
 		auto memory = RE::aligned_alloc(alignof(RE::NiNode), sizeof(RE::NiNode));
 		if (!memory) {
 			return nullptr;
@@ -588,14 +732,75 @@ namespace RC::Engine
 		}
 	}
 
+	namespace
+	{
+		// The precombine switch as a game setting. Fallout 4 keeps bUseCombinedObjects in the
+		// GameSettingCollection, whose singleton the Runtime Database carries for OG, NG and AE alike
+		// (RE::GameSettingCollection::GetSingleton() in RE/Bethesda/Settings.h). Reading it through the
+		// collection avoids needing the address of the engine's own global, which only OG has an id for.
+		constexpr std::string_view kUseCombinedSetting = "bUseCombinedObjects"sv;
+		constexpr std::size_t      kSettingValue = 0x08;  // SETTING_VALUE Setting::_value (private; see Settings.h)
+
+		// The Setting for a_name, or null. Main thread.
+		[[nodiscard]] RE::Setting* FindSetting(std::string_view a_name)
+		{
+			const auto collection = RE::GameSettingCollection::GetSingleton();
+			if (!collection) {
+				return nullptr;
+			}
+			const auto it = collection->settings.find(a_name);
+			return it != collection->settings.end() ? it->second : nullptr;
+		}
+
+		// Whether the switch is on, or nullopt when the setting is not there (an older or trimmed table).
+		[[nodiscard]] std::optional<bool> ReadSettingBool(std::string_view a_name)
+		{
+			const auto setting = FindSetting(a_name);
+			if (!setting) {
+				return std::nullopt;
+			}
+			return *Field<const std::uint8_t>(setting, kSettingValue) != 0;
+		}
+
+		// Sets the switch. False when the setting is not there. The value lives behind a private member
+		// (SETTING_VALUE Setting::_value at +0x08) and the SDK exposes no SetBinary, so it is written at
+		// that offset; the collection is the engine's own, so the change sticks for the cell loads that follow.
+		[[nodiscard]] bool WriteSettingBool(std::string_view a_name, bool a_value)
+		{
+			const auto setting = FindSetting(a_name);
+			if (!setting) {
+				return false;
+			}
+			*Field<std::uint8_t>(setting, kSettingValue) = a_value ? 1 : 0;
+			return true;
+		}
+	}
+
 	bool PrecombinesEnabled() noexcept
 	{
-		return *reinterpret_cast<const volatile std::uint8_t*>(g.useCombined) != 0;
+		if (g.useCombined) {
+			return *reinterpret_cast<const volatile std::uint8_t*>(g.useCombined) != 0;
+		}
+		try {
+			return ReadSettingBool(kUseCombinedSetting).value_or(true);
+		} catch (...) {
+			return true;  // precombines on: the safe reading, the engine's own default
+		}
 	}
 
 	void SetPrecombinesEnabled(bool a_enabled) noexcept
 	{
-		*reinterpret_cast<volatile std::uint8_t*>(g.useCombined) = a_enabled ? 1 : 0;
+		if (g.useCombined) {
+			*reinterpret_cast<volatile std::uint8_t*>(g.useCombined) = a_enabled ? 1 : 0;
+			return;
+		}
+		try {
+			if (!WriteSettingBool(kUseCombinedSetting, a_enabled)) {
+				logger::error("bUseCombinedObjects is not in the GameSettingCollection: precombines are left as they are");
+			}
+		} catch (...) {
+			logger::error("bUseCombinedObjects could not be written: precombines are left as they are");
+		}
 	}
 
 	bool ReadChunkView(const RE::NiAVObject* a_shape, const RE::BSFadeNode* a_fadeNode, ChunkView& a_out) noexcept
@@ -788,10 +993,10 @@ namespace RC::Engine
 
 	bool InstallGameResetHook(void (*a_after)())
 	{
-		bool       ok = true;
-		const auto reset = Resolve(kGameResetID, "Main::PerformGameReset", ok);
-		const auto purge = Resolve(kPurgeCellsID, "TES::PurgeBufferedCells", ok);
-		if (!ok || !a_after) {
+		const auto reset = Ask(kGameResetID, "Main::PerformGameReset");
+		const auto purge = Ask(kPurgeCellsID, "TES::PurgeBufferedCells");
+		if (!reset || !purge || !a_after) {
+			g_caps.resetHook = false;
 			return false;
 		}
 		const auto site = reset + kGameResetPurgeSite;

@@ -1928,6 +1928,12 @@ namespace RC::Combine::Manager
 
 	void Install()
 	{
+		// Plugin.cpp only calls this once the engine ids and layouts are verified (Capabilities::CombineReady).
+		// Guard anyway so a future caller cannot install a hook whose target is missing.
+		if (!Engine::Caps().CombineReady()) {
+			logger::error("Install() called without the engine capabilities: nothing installed");
+			return;
+		}
 		std::thread(WorkerMain).detach();  // lives as long as the process; never joined at exit
 		REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE::PlayerCharacter[0] };
 		g_originalUpdate = vtable.write_vfunc(kUpdateSlot, &UpdateHook);
@@ -1949,7 +1955,9 @@ namespace RC::Combine::Manager
 		const auto& settings = Settings::Get();
 		g_configuredPrecombines = Engine::PrecombinesEnabled();
 		if (settings.disablePrecombines) {
-			if (Engine::PrecombinesEnabled()) {
+			if (!Engine::Caps().precombines) {
+				logger::warn("bDisablePrecombines is set but the bUseCombinedObjects address is missing: precombines stay on");
+			} else if (Engine::PrecombinesEnabled()) {
 				Engine::SetPrecombinesEnabled(false);
 				logger::info("precombines switched off (bUseCombinedObjects = 0): every static loads its own 3D and is combined here");
 			} else {

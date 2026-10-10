@@ -2,6 +2,7 @@ build/
 .vs/
 external/CommonLibF4RD/
 pyghidra_mcp_projects/
+__pycache__/
 # Ignore large backup archives
 *.tar
 *.zip

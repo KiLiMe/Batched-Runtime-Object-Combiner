@@ -21,7 +21,7 @@ endif()
 
 # MO2 mod folder the plugin (DLL, PDB, meta.ini; the INI only when the folder has none) is copied into after
 # every build; empty disables it.
-set(RC_INSTALL_DIR "D:/MO2/Fallout 4/mods/Runtime Combiner" CACHE PATH "MO2 mod folder to install the plugin into")
+set(RC_INSTALL_DIR "F:/MODs_dir/Fallout 4/mods/Batched Runtime Object Combiner(BROC)" CACHE PATH "MO2 mod folder to install the plugin into")
 
 # ---- dependencies ----------------------------------------------------------------------------------------
 set(Boost_USE_STATIC_LIBS ON)

@@ -104,12 +104,20 @@ extern "C" __declspec(dllexport) bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadIn
 
 	F4SE::Init(a_f4se);
 	const auto& module = REL::Module::get();
-	if (!module.is_og()) {
-		logger::warn("engine layouts and ids are verified for 1.10.163 (OG) only; installing nothing on {}", module.version().string());
-		return true;
-	}
-	if (!RC::Engine::Init()) {
-		logger::error("engine addresses missing: installing nothing");
+	const auto  caps = RC::Engine::Init();
+
+	// Combining needs ids and class layouts that were read from 1.10.163. On a runtime that offers them
+	// (so far only OG), or once the AE ids and layouts are verified, Install() runs. Elsewhere the plugin
+	// still loads: it reads its ini, logs what is missing and leaves the scene exactly as the engine built
+	// it. Nothing below touches the game when a capability is absent.
+	if (!caps.CombineReady()) {
+		logger::warn(
+			"combining is not enabled on {}: its engine ids are verified for 1.10.163 (OG) only; "
+			"the plugin loads, reads RuntimeCombiner.ini and changes nothing in the scene",
+			module.version().string());
+		logger::info(
+			"precombine switch: {}",
+			caps.precombines ? "available (bDisablePrecombines would work once combining is enabled)" : "unavailable");
 		return true;
 	}
 
