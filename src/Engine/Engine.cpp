@@ -210,8 +210,8 @@ namespace RC::Engine
 		// The GameSettingCollection path for the same switch: the id resolves on every family, so on AE this
 		// is what makes caps.precombines true. Probe it non-fatally; a missing singleton just leaves it false.
 		g.settingCollection = ProbeSettingCollection();
-		g.previsEnabled = Ask(kPrevisEnabledID, "previs query");
-		g.previsActive = Ask(kPrevisActiveID, "previs active query");
+		g.previsEnabled = Ask(kPrevisEnabledID, "BSPreCulledObjects::QWantEnabled");
+		g.previsActive = Ask(kPrevisActiveID, "BSPreCulledObjects::QEnabled");
 		g.setRange = Ask(kSetRangeID, "BSFadeNode::SetRange");
 		g.fadeMults = Ask(kFadeMultsID, "fade multipliers");
 		g.fadeDistMult = Ask(kFadeDistMultID, "fDistanceMultiplier");
@@ -219,7 +219,7 @@ namespace RC::Engine
 		// Optional: without them chunks are not drawn while previs draws the main view (the originals are shown then).
 		const auto renderPreUI = Ask(kRenderPreUIID, "Render_PreUI");
 		g.previsQuerySite = renderPreUI ? renderPreUI + kPrevisQuerySite : 0;
-		g.previsQuery = Ask(kPrevisQueryID, "previs query");
+		g.previsQuery = Ask(kPrevisQueryID, "the per-frame previs query");
 		g.visibility = Ask(kVisibilityID, "MultiCellVisibilityData");
 		g.registerDynamic = Ask(kRegisterDynamicID, "RegisterDynamicObject");
 		g.unregisterDynamic = Ask(kUnregisterDynamicID, "UnregisterDynamicObject");

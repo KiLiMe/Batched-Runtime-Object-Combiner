@@ -29,14 +29,31 @@ stops the game) when the id does not resolve. `Engine.cpp` therefore calls
 optional RVA, and skips the lookup entirely when `id(version)` is INVALID_ID. A
 missing id costs a capability, never the session.
 
-Result on AE (1.11.240, after the first batch of ids was filled in)
------------------------------------------------------------------
-    27 of 33 ids miss, but 9 of them now carry an AE slot:
-        5 VTABLEs (REL::ID(n, n), present on every family)
-        TES singleton and GridCellArray::Get (filled in from the AE-only CommonLibF4,
-            see the FINDINGS block below)
-    CombineReady() is still false: clone / triShape / geometry / nodes / update /
-    fade are all still OG-only, so Plugin.cpp logs and installs nothing.
+Result on AE (1.11.240)
+---------------------
+Offline (this script) and on a live start (2026-10-11, log path below) agree:
+
+    23 engine ids miss  -> the OG-only function/global ids (Engine.cpp "Ask" list)
+     6 VTABLEs resolve  -> BSTriShape, BSMeshLODTriShape, NiNode, BSFadeNode,
+                           BSLightingShaderProperty, BSEffectShaderProperty
+     extra ids resolve  -> TES::Singleton, GridCellArray::Get,
+                           GameSettingCollection::Singleton
+    CombineReady() == false -> Plugin.cpp logs and installs nothing
+
+The live log (D:\UserData\F4SE_log\RuntimeCombiner.log on the porting machine)
+reads:
+
+    Runtime Combiner v0.3.1 loading: game 1-11-240-0, F4SE 0-7-9-0
+    settings (RuntimeCombiner.ini): enabled true, ...
+    23 engine ids are missing on 1-11-240-0: NiObject::Clone, ...
+    engine ids: combine incomplete, previs missing, precombines available -> combining disabled
+    combining is not enabled on 1-11-240-0: its engine ids are verified for
+      1.10.163 (OG) only; the plugin loads, reads RuntimeCombiner.ini and
+      changes nothing in the scene
+    precombine switch: available (bDisablePrecombines would work once combining is enabled)
+
+Six lines for the whole start, no error box: the fatal path
+(REL::ID::address() -> stl::report_and_fail) is never reached.
 
 Class layouts are NOT the blocker
 ---------------------------------
